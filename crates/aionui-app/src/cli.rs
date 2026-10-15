@@ -206,6 +206,8 @@ pub(crate) enum TeamCommand {
     Members,
     ReadMessages,
     SendMessage,
+    /// Opt-in hub/department summary delivery or transport receipt lookup.
+    CrossTeamMessage,
     InterruptAgent,
     Task(TeamTaskArgs),
     ListAssistants,

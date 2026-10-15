@@ -19,6 +19,29 @@ impl SqliteTeamRepository {
 
 #[async_trait::async_trait]
 impl ITeamRepository for SqliteTeamRepository {
+    async fn cross_team_counts(
+        &self,
+        user_id: &str,
+        source: &str,
+        target: &str,
+        task_id: &str,
+        since: i64,
+    ) -> Result<(i64, i64), DbError> {
+        // Only native rows with a valid compact envelope participate. Return
+        // counts, never fetch an unbounded conversation/mailbox history.
+        let rows: (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(CASE WHEN m.team_id = ? AND json_extract(CASE WHEN json_valid(m.summary) THEN m.summary ELSE '{}' END, '$.source_team_id') = ? AND m.created_at >= ? THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN json_extract(CASE WHEN json_valid(m.summary) THEN m.summary ELSE '{}' END, '$.task_id') = ? THEN 1 ELSE 0 END), 0) \
+             FROM mailbox m JOIN teams t ON t.id = m.team_id \
+             WHERE t.user_id = ? AND m.team_id IN (?, ?) AND m.id LIKE 'xteam-%' \
+             AND json_valid(m.summary) AND json_extract(CASE WHEN json_valid(m.summary) THEN m.summary ELSE '{}' END, '$.kind') = 'cross_team' \
+             AND ((m.team_id = ? AND json_extract(CASE WHEN json_valid(m.summary) THEN m.summary ELSE '{}' END, '$.source_team_id') = ?) \
+               OR (m.team_id = ? AND json_extract(CASE WHEN json_valid(m.summary) THEN m.summary ELSE '{}' END, '$.source_team_id') = ?))"
+        ).bind(target).bind(source).bind(since).bind(task_id).bind(user_id)
+            .bind(source).bind(target).bind(target).bind(source).bind(source).bind(target)
+            .fetch_one(&self.pool).await?;
+        Ok(rows)
+    }
     // ── Team CRUD ────────────────────────────────────────────────────
 
     async fn create_team(&self, row: &TeamRow) -> Result<(), DbError> {

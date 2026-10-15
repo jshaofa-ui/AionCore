@@ -17,6 +17,7 @@ mod connection_test;
 mod conversation;
 mod conversation_tools;
 mod cron;
+mod cross_team;
 mod custom_agent;
 mod extension;
 mod file;
@@ -115,6 +116,7 @@ pub use cron::{
     CronJobResponse, CronJobStateDto, CronJobTargetDto, CronScheduleDto, HasSkillResponse, ListCronJobsQuery,
     RunNowResponse, SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
 };
+pub use cross_team::{CrossTeamMessageRequest, CrossTeamOperation, CrossTeamReceipt};
 pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,

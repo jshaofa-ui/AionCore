@@ -143,6 +143,19 @@ struct SendMessageParams {
     files: Vec<String>,
 }
 
+#[derive(Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CrossTeamMessageParams {
+    operation: String,
+    target_team_id: String,
+    request_id: String,
+    task_id: Option<String>,
+    summary: Option<String>,
+    #[serde(default)]
+    references: Vec<String>,
+    expires_at_ms: Option<i64>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct InterruptAgentParams {
@@ -285,6 +298,18 @@ struct DescribeAssistantParams {
 
 #[tool_router]
 impl TeamStdioServer {
+    #[tool(
+        name = "team_cross_team_message",
+        description = "Send one compact task summary to an allowed external team's current lead, or read its transport receipt without waking a model. Requires operator opt-in and an allowed hub/department pair. Reuse request_id for retries. Never send conversation history, credentials or private account data. A consumed receipt is not business completion."
+    )]
+    async fn cross_team_message(&self, Parameters(params): Parameters<CrossTeamMessageParams>) -> CallToolResult {
+        // The authenticated TCP server owns authorization and all bounds checks.
+        // ListTools also uses that server's role-filtered shared descriptors.
+        match serde_json::to_value(params) {
+            Ok(arguments) => self.forward_to_tcp("team_cross_team_message", &arguments).await,
+            Err(_) => CallToolResult::error(vec![Content::text("Invalid cross-team arguments")]),
+        }
+    }
     #[tool(
         name = "team_read_messages",
         description = "Peek at your own unread team mailbox messages. Returns at most the oldest 50 unread messages in FIFO order, each with a message_id. When has_more is true, call again with since_message_id set to the returned next_since_message_id to read the following page. Messages returned in full are marked read only if the current turn completes successfully; failed or cancelled turns preserve them for retry. A message with content_truncated=true is a preview only: it stays unread and is redelivered in full on a later turn, so do not act on it yet."
@@ -871,7 +896,7 @@ mod tests {
     fn team_stdio_descriptions_match_prompt_registry() {
         let router = TeamStdioServer::tool_router();
         let tools = router.list_all();
-        assert_eq!(tools.len(), 13, "stdio must expose the complete shared registry");
+        assert_eq!(tools.len(), 14, "stdio must expose the complete shared registry");
         let mut actual_names: Vec<_> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         actual_names.sort_unstable();
         let mut expected_names: Vec<_> = aionui_team_prompts::tools::team_tool_specs()
@@ -897,6 +922,81 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cross_team_stdio_forwards_to_real_authenticated_role_filtered_tcp_server() {
+        use aionui_team::{Mailbox, TaskBoard, TeamAgent, TeamMcpServer, TeammateManager};
+        use std::sync::{Arc, Weak};
+        struct SilentEvents;
+        impl aionui_realtime::EventBroadcaster for SilentEvents {
+            fn broadcast(&self, _event: aionui_api_types::WebSocketMessage<serde_json::Value>) {}
+        }
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo = Arc::new(aionui_db::SqliteTeamRepository::new(db.pool().clone()));
+        let events: Arc<dyn aionui_realtime::EventBroadcaster> = Arc::new(SilentEvents);
+        let agents: Vec<TeamAgent> = serde_json::from_value(json!([
+            {"slot_id":"lead","name":"Lead","role":"lead","conversation_id":"lead-conversation","backend":"acp","model":"synthetic"},
+            {"slot_id":"worker","name":"Worker","role":"teammate","conversation_id":"worker-conversation","backend":"acp","model":"synthetic"}
+        ])).unwrap();
+        let scheduler = Arc::new(TeammateManager::new(
+            "synthetic-team".into(),
+            "synthetic-user".into(),
+            &agents,
+            Arc::new(Mailbox::new(repo.clone())),
+            Arc::new(TaskBoard::new(repo)),
+            events.clone(),
+        ));
+        let tcp = TeamMcpServer::start(
+            "synthetic-test-token".into(),
+            scheduler,
+            "synthetic-team".into(),
+            events,
+            Weak::new(),
+        )
+        .await
+        .unwrap();
+        let worker = TeamStdioServer {
+            port: tcp.port(),
+            token: "synthetic-test-token".into(),
+            slot_id: "worker".into(),
+        };
+        let worker_tools = worker.list_tools_from_tcp().await.unwrap();
+        assert!(worker_tools.iter().all(|tool| tool.name != "team_cross_team_message"));
+        let request = || {
+            serde_json::from_value::<CrossTeamMessageParams>(
+                json!({"operation":"status","target_team_id":"remote","request_id":"r"}),
+            )
+            .unwrap()
+        };
+        let denied = worker.cross_team_message(Parameters(request())).await;
+        assert_eq!(denied.is_error, Some(true));
+        assert_eq!(
+            denied.structured_content.as_ref().unwrap()["domainCode"],
+            "permission_denied"
+        );
+        let lead = TeamStdioServer {
+            port: tcp.port(),
+            token: "synthetic-test-token".into(),
+            slot_id: "lead".into(),
+        };
+        assert!(
+            lead.list_tools_from_tcp()
+                .await
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "team_cross_team_message")
+        );
+        let reached_service_boundary = lead.cross_team_message(Parameters(request())).await;
+        assert_eq!(reached_service_boundary.is_error, Some(true));
+        // This deliberately has no live service. Reaching this exact error
+        // proves the stdio handler passed authentication, role checks and typed
+        // request parsing, and reached the real cross-team TCP dispatch branch.
+        assert_eq!(
+            reached_service_boundary.structured_content.as_ref().unwrap()["domainCode"],
+            "transport_unavailable"
+        );
+        tcp.stop();
     }
 
     #[test]

@@ -21,6 +21,14 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
+    /// Persist a server-prepared stable-ID row and retain native UI events.
+    pub(crate) async fn write_prepared(&self, row: &MailboxMessageRow) -> Result<(), TeamError> {
+        self.repo.write_message(&self.user_id, row).await?;
+        if let Some(events) = &self.events {
+            events.broadcast_mailbox_changed(mailbox_row_to_response(row), TeamMailboxChange::Created);
+        }
+        Ok(())
+    }
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
         Self::new_for_user(repo, "system_default_user")
     }

@@ -159,7 +159,11 @@ fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ()
 fn status_for_error(code: TeamToolErrorCode) -> StatusCode {
     match code {
         TeamToolErrorCode::RuntimeAuthFailed => StatusCode::UNAUTHORIZED,
-        TeamToolErrorCode::PermissionDenied | TeamToolErrorCode::NotInTeam => StatusCode::FORBIDDEN,
+        TeamToolErrorCode::PermissionDenied | TeamToolErrorCode::NotInTeam | TeamToolErrorCode::FeatureDisabled => {
+            StatusCode::FORBIDDEN
+        }
+        TeamToolErrorCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        TeamToolErrorCode::IdempotencyConflict => StatusCode::CONFLICT,
         TeamToolErrorCode::ConversationNotFound
         | TeamToolErrorCode::TeamNotFound
         | TeamToolErrorCode::AgentNotFound => StatusCode::NOT_FOUND,

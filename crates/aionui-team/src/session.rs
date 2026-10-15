@@ -140,9 +140,105 @@ pub struct TeamSession {
     /// Reset only by constructing a fresh `TeamSession` during a new restore,
     /// reconnect, or explicit re-ensure lifecycle.
     recovery_scan_completed: AtomicBool,
+    #[cfg(test)]
+    cross_team_abort_commit_once: AtomicBool,
+    #[cfg(test)]
+    cross_team_commit_failure_observed: AtomicBool,
 }
 
 impl TeamSession {
+    #[cfg(test)]
+    pub(crate) fn cross_team_commit_failure_was_observed(&self) -> bool {
+        self.cross_team_commit_failure_observed.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_cross_team_commit_failure(&self) {
+        self.cross_team_abort_commit_once.store(true, Ordering::Release);
+    }
+    /// Receive an authenticated remote lead's compact envelope. This is never
+    /// a human intervention and never resumes a paused slot or parses commands.
+    pub(crate) async fn receive_cross_team_message(
+        &self,
+        id: &str,
+        source_team: &str,
+        sender: &TeamAgent,
+        target_slot: &str,
+        content: &str,
+        summary: &str,
+    ) -> Result<aionui_db::models::MailboxMessageRow, TeamError> {
+        let target = self.scheduler.get_agent(target_slot).await?;
+        if target.role != TeammateRole::Lead {
+            return Err(TeamError::Forbidden("CROSS_TEAM_FORBIDDEN: target must be lead".into()));
+        }
+        self.ensure_member_runtime_lazy(target_slot, true).await?;
+        self.publish_runtime_constraint(target_slot).await?;
+        let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
+            slot_id: target_slot.into(),
+            role: target_role_for(target.role),
+            source: WorkSource::McpSendMessage,
+            binding: CausalBinding::SystemInitiated { inherit_from: None },
+        })?;
+        let row = aionui_db::models::MailboxMessageRow {
+            id: id.into(),
+            team_id: self.team.id.clone(),
+            to_agent_id: target_slot.into(),
+            from_agent_id: format!("xteam:{source_team}:{}", sender.slot_id),
+            msg_type: "message".into(),
+            content: content.into(),
+            summary: Some(summary.into()),
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
+        };
+        if let Err(error) = self.mailbox.write_prepared(&row).await {
+            self.work_coordinator.abort_enqueue(&lease, "cross_team_persist_failed");
+            return Err(error);
+        }
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        if let Err(_error) = projection
+            .project(TeamProjectionRequest {
+                user_id: self.user_id.clone(),
+                team_id: self.team.id.clone(),
+                slot_id: target_slot.into(),
+                conversation_id: target.conversation_id.clone(),
+                source: TeamProjectionSource::Teammate {
+                    from_slot_id: row.from_agent_id.clone(),
+                    from_name: format!("{source_team}/{}", sender.name),
+                    sender_backend: Some(sender.backend.clone()),
+                    sender_conversation_id: Some(sender.conversation_id.clone()),
+                },
+                content: content.into(),
+                files: vec![],
+                visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+                dedupe_key: Some(teammate_dedupe_key(&self.team.id, id, &target.conversation_id)),
+            })
+            .await
+        {
+            tracing::warn!(
+                message_id = id,
+                "Cross-team UI projection deferred; durable mailbox retained"
+            );
+        }
+        // Do not use commit_persisted_enqueue's ordinary compensation: it
+        // marks a failed enqueue read, which would falsely claim consumption.
+        #[cfg(test)]
+        if self.cross_team_abort_commit_once.swap(false, Ordering::AcqRel) {
+            self.work_coordinator
+                .abort_enqueue(&lease, "cross_team_test_injected_lease_loss");
+            eprintln!("F1 injection: durable mailbox retained after enqueue lease loss");
+        }
+        if self.work_coordinator.commit_enqueue(&lease, Some(id.into())).is_err() {
+            #[cfg(test)]
+            self.cross_team_commit_failure_observed.store(true, Ordering::Release);
+            self.work_coordinator.abort_enqueue(&lease, "cross_team_commit_failed");
+            tracing::warn!(
+                message_id = id,
+                "Cross-team enqueue deferred to durable mailbox recovery"
+            );
+        }
+        self.event_loops.notify(target_slot);
+        Ok(row)
+    }
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         team: Team,
@@ -252,6 +348,10 @@ impl TeamSession {
             member_runtimes,
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
+            #[cfg(test)]
+            cross_team_abort_commit_once: AtomicBool::new(false),
+            #[cfg(test)]
+            cross_team_commit_failure_observed: AtomicBool::new(false),
         })
     }
 
@@ -2833,6 +2933,34 @@ mod tests {
         let session = start_session().await;
         assert_eq!(session.team_id(), "t1");
         assert!(session.mcp_server.port() > 0);
+        session.stop();
+    }
+
+    #[tokio::test]
+    async fn cross_team_delivery_preserves_paused_lead_and_cannot_address_workers() {
+        let session = start_session().await;
+        let mut sender = make_team().agents[0].clone();
+        sender.slot_id = "remote-lead".into();
+        session.work_coordinator.pause_slot("lead-1");
+        let row = session
+            .receive_cross_team_message("xteam-paused", "remote", &sender, "lead-1", "/compact", "{}")
+            .await
+            .unwrap();
+        assert!(!row.read);
+        assert_eq!(row.from_agent_id, "xteam:remote:remote-lead");
+        assert_eq!(
+            session.work_coordinator.slot_snapshot("lead-1").unwrap().state,
+            crate::work_coordinator::SlotPhase::Paused
+        );
+        assert!(!matches!(
+            session.work_coordinator.next("lead-1"),
+            ReconcileDecision::Claim(_)
+        ));
+        let error = session
+            .receive_cross_team_message("xteam-worker", "remote", &sender, "worker-1", "hello", "{}")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("target must be lead"));
         session.stop();
     }
 

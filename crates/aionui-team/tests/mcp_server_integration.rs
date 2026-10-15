@@ -248,7 +248,7 @@ async fn mc1_correct_token_connects() {
     send_request(&mut stream, &req).await;
     let resp = read_response(&mut stream).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
     let names: Vec<&str> = tools.iter().filter_map(|tool| tool["name"].as_str()).collect();
     assert!(!names.contains(&"team_list_models"));
 
@@ -310,12 +310,13 @@ async fn mc3_no_token_rejected() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_returns_all_13_tools() {
+async fn tools_list_returns_all_14_tools() {
     let env = setup().await;
     let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
 
     let names = list_tools(&mut stream, 10).await;
-    assert_eq!(names.len(), 13);
+    assert_eq!(names.len(), 14);
+    assert!(names.contains(&"team_cross_team_message".to_owned()));
 
     assert!(names.contains(&"team_read_messages".to_owned()));
     assert!(names.contains(&"team_send_message".to_owned()));
@@ -1280,6 +1281,56 @@ async fn interrupt_agent_is_hidden_from_and_refused_to_a_teammate() {
         "a teammate calling it directly must be refused, got {text:?}"
     );
 
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn cross_team_tool_is_hidden_from_and_refused_to_a_teammate_on_the_wire() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "worker-1").await;
+    assert!(
+        !list_tools(&mut stream, 2)
+            .await
+            .contains(&"team_cross_team_message".to_owned())
+    );
+    let response = call_tool(
+        &mut stream,
+        3,
+        "team_cross_team_message",
+        json!({
+            "operation":"status", "target_team_id":"other-team", "request_id":"r1"
+        }),
+    )
+    .await;
+    assert!(is_error_response(&response));
+    assert!(extract_text(&response).contains("Only Lead can use team_cross_team_message"));
+    env.server.stop();
+}
+
+#[tokio::test]
+async fn cross_team_tool_rejects_forged_identity_before_service_lookup() {
+    let env = setup().await;
+    let mut stream = connect_and_init(env.server.port(), "test-token-123", "lead-1").await;
+    for (offset, field) in [
+        "user_id",
+        "source_team_id",
+        "from_slot_id",
+        "to_slot_id",
+        "history",
+        "files",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut request = json!({"operation":"status", "target_team_id":"other-team", "request_id":"r1"});
+        request[*field] = json!("forged");
+        let response = call_tool(&mut stream, 10 + offset as u64, "team_cross_team_message", request).await;
+        assert!(is_error_response(&response), "{field}");
+        assert!(
+            extract_text(&response).contains("invalid compact cross-team envelope"),
+            "{field}"
+        );
+    }
     env.server.stop();
 }
 

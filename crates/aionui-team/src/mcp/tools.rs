@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn all_descriptors_count() {
-        assert_eq!(all_tool_descriptors().len(), 13);
+        assert_eq!(all_tool_descriptors().len(), 14);
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         let mut names: Vec<&str> = descs.iter().map(|d| d.name.as_str()).collect();
         names.sort();
         names.dedup();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 14);
     }
 
     #[test]

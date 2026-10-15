@@ -523,6 +523,19 @@ pub(crate) async fn dispatch_tool(
     super::tools::authorize_tool(caller_role, tool_name).map_err(ToolCallError::from_message)?;
 
     match tool_name {
+        "team_cross_team_message" => {
+            let input: aionui_api_types::CrossTeamMessageRequest = serde_json::from_value(arguments.clone())
+                .map_err(|_| ToolCallError::from_message("Invalid params: invalid compact cross-team envelope"))?;
+            let svc = service
+                .upgrade()
+                .ok_or_else(|| ToolCallError::from_message("Team service not available"))?;
+            let receipt = svc
+                .cross_team_message(team_id, caller_slot_id, input)
+                .await
+                .map_err(|error| ToolCallError::from_message(error.to_string()))?;
+            serde_json::to_string(&receipt)
+                .map_err(|error| ToolCallError::from_message(format!("Serialization error: {error}")))
+        }
         "team_read_messages" => exec_read_messages(arguments, service, team_id, caller_slot_id).await,
         "team_send_message" => exec_send_message(arguments, scheduler, service, team_id, caller_slot_id).await,
         "team_interrupt_agent" => {

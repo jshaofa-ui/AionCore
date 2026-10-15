@@ -49,6 +49,18 @@ pub struct UpdateTaskParams {
 /// Object-safe via `async_trait` to support `Arc<dyn ITeamRepository>`.
 #[async_trait::async_trait]
 pub trait ITeamRepository: Send + Sync {
+    /// Bounded-result durable accounting for the opt-in cross-team channel.
+    /// Implementations without this capability fail closed.
+    async fn cross_team_counts(
+        &self,
+        _user_id: &str,
+        _source: &str,
+        _target: &str,
+        _task_id: &str,
+        _since: i64,
+    ) -> Result<(i64, i64), DbError> {
+        Err(DbError::Init("cross-team accounting unsupported".into()))
+    }
     // ── Team CRUD ────────────────────────────────────────────────────
 
     /// Inserts a new team record.

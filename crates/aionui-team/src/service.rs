@@ -1,3 +1,5 @@
+mod cross_team;
+mod cross_team_policy;
 mod describe_support;
 mod response_builder;
 pub(crate) mod spawn_support;
@@ -147,6 +149,8 @@ struct MemberRuntimeReconcileWork {
 }
 
 pub struct TeamSessionService {
+    cross_team_policy: RwLock<cross_team_policy::CrossTeamPolicy>,
+    cross_team_accept_lock: tokio::sync::Mutex<()>,
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
@@ -284,6 +288,8 @@ impl TeamSessionService {
         prompt_dump: TeamPromptDumpConfig,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
+            cross_team_policy: RwLock::new(cross_team_policy::CrossTeamPolicy::from_env()),
+            cross_team_accept_lock: tokio::sync::Mutex::new(()),
             repo,
             agent_metadata_repo,
             assistant_catalog,

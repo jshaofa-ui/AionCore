@@ -96,7 +96,17 @@ fn team_tool_role(role: TeammateRole) -> TeamToolRole {
 }
 
 fn map_tool_error(error: ToolCallError) -> TeamToolErrorPayload {
-    let code = if error.message.starts_with("Unknown tool:") {
+    let code = if error.message.contains("CROSS_TEAM_DISABLED") {
+        TeamToolErrorCode::FeatureDisabled
+    } else if error.message.contains("CROSS_TEAM_FORBIDDEN") {
+        TeamToolErrorCode::PermissionDenied
+    } else if error.message.contains("CROSS_TEAM_INVALID") {
+        TeamToolErrorCode::SchemaValidationFailed
+    } else if error.message.contains("CROSS_TEAM_RATE_LIMITED") || error.message.contains("CROSS_TEAM_TASK_LIMIT") {
+        TeamToolErrorCode::RateLimited
+    } else if error.message.contains("CROSS_TEAM_IDEMPOTENCY_CONFLICT") {
+        TeamToolErrorCode::IdempotencyConflict
+    } else if error.message.starts_with("Unknown tool:") {
         TeamToolErrorCode::UnknownTool
     } else if error.message.starts_with("Only Lead") {
         TeamToolErrorCode::PermissionDenied

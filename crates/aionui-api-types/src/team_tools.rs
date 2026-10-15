@@ -68,6 +68,7 @@ pub enum TeamToolName {
     TeamMembers,
     TeamReadMessages,
     TeamSendMessage,
+    TeamCrossTeamMessage,
     TeamInterruptAgent,
     TeamTaskCreate,
     TeamTaskUpdate,
@@ -86,6 +87,7 @@ impl TeamToolName {
             Self::TeamMembers => "team_members",
             Self::TeamReadMessages => "team_read_messages",
             Self::TeamSendMessage => "team_send_message",
+            Self::TeamCrossTeamMessage => "team_cross_team_message",
             Self::TeamInterruptAgent => "team_interrupt_agent",
             Self::TeamTaskCreate => "team_task_create",
             Self::TeamTaskUpdate => "team_task_update",
@@ -104,6 +106,7 @@ impl TeamToolName {
             "team_members" => Self::TeamMembers,
             "team_read_messages" => Self::TeamReadMessages,
             "team_send_message" => Self::TeamSendMessage,
+            "team_cross_team_message" => Self::TeamCrossTeamMessage,
             "team_interrupt_agent" => Self::TeamInterruptAgent,
             "team_task_create" => Self::TeamTaskCreate,
             "team_task_update" => Self::TeamTaskUpdate,
@@ -156,6 +159,9 @@ pub enum TeamToolErrorCode {
     TransportUnavailable,
     RuntimeContextMissing,
     RuntimeAuthFailed,
+    FeatureDisabled,
+    RateLimited,
+    IdempotencyConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -369,6 +375,27 @@ fn tool_specs() -> Vec<TeamToolSpec> {
             input_summary: "to, message",
         },
         TeamToolSpec {
+            name: TeamToolName::TeamCrossTeamMessage,
+            permission: TeamToolPermission::LeadOnly,
+            description: "Send one compact task summary to an allowed external team's current lead, or read its transport receipt without waking a model. Requires operator opt-in and an allowed hub/department pair. Reuse request_id for retries. Never send conversation history, credentials or private account data. A consumed receipt is not business completion.",
+            input_schema: json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "operation": { "type": "string", "enum": ["send", "status"] },
+                    "target_team_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                    "summary": { "type": "string", "minLength": 1, "maxLength": 1200 },
+                    "references": { "type": "array", "maxItems": 8, "items": { "type": "string", "maxLength": 1024 } },
+                    "expires_at_ms": { "type": "integer", "description": "Required for send; future UTC milliseconds, at most one hour ahead" }
+                },
+                "required": ["operation", "target_team_id", "request_id"]
+            }),
+            cli_command: &["cross-team-message"],
+            when: "Send a cross-team task or read its receipt",
+            input_summary: "operation, target_team_id, request_id; send: task_id, summary, expires_at_ms, optional references",
+        },
+        TeamToolSpec {
             name: TeamToolName::TeamInterruptAgent,
             permission: TeamToolPermission::LeadOnly,
             description: "Immediately stop a teammate's active turn and durably deliver a replacement instruction as its next highest-priority message.",
@@ -576,9 +603,28 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn cross_team_contract_is_lead_only_and_has_no_identity_override() {
+        let tools = team_tool_descriptors();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "team_cross_team_message")
+            .expect("controlled cross-team messaging must have a native tool");
+        assert!(tool.lead_only());
+        assert_eq!(tool.cli_command, vec!["cross-team-message"]);
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.input_schema["properties"].get("user_id").is_none());
+        assert!(tool.input_schema["properties"].get("from_slot_id").is_none());
+        assert!(
+            team_tool_descriptors_for_role(TeamToolRole::Teammate)
+                .iter()
+                .all(|tool| tool.name != "team_cross_team_message")
+        );
+    }
+
+    #[test]
     fn descriptor_count_and_names_are_unique() {
         let descriptors = team_tool_descriptors();
-        assert_eq!(descriptors.len(), 13);
+        assert_eq!(descriptors.len(), 14);
         let names = descriptors
             .iter()
             .map(|descriptor| descriptor.name.as_str())
