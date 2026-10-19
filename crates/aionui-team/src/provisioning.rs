@@ -93,6 +93,23 @@ pub struct TeamConversationModelFacts {
 
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
+    async fn assistant_configuration_fingerprint(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _assistant_id: &str,
+    ) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+    async fn synchronize_assistant_configuration(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _assistant_id: &str,
+    ) -> Result<Option<aionui_api_types::TeamAssistantConfiguration>, TeamError> {
+        Ok(None)
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
@@ -585,7 +602,28 @@ impl TeamAgentProvisioner {
         self.conversation_port
             .patch_runtime_config(&agent.conversation_id, patch)
             .await?;
+        if let Some(assistant_id) = agent.assistant_id.as_deref()
+            && let Some(fingerprint) = self
+                .conversation_port
+                .assistant_configuration_fingerprint(user_id, &agent.conversation_id, assistant_id)
+                .await?
+        {
+            return Ok(Some(fingerprint));
+        }
         Ok(resolution.fingerprint)
+    }
+
+    pub(crate) async fn synchronize_assistant_configuration(
+        &self,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<Option<aionui_api_types::TeamAssistantConfiguration>, TeamError> {
+        let Some(assistant_id) = agent.assistant_id.as_deref() else {
+            return Ok(None);
+        };
+        self.conversation_port
+            .synchronize_assistant_configuration(user_id, &agent.conversation_id, assistant_id)
+            .await
     }
 
     /// Pick how team tools reach this agent from the unified capability port.
@@ -911,7 +949,7 @@ impl TeamAgentProvisioner {
         extra
     }
 
-    async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
+    pub(crate) async fn persist_agents(&self, team_id: &str, agents: &[TeamAgent]) -> Result<(), TeamError> {
         let agents_json = serde_json::to_string(agents)?;
         let row = self
             .repo

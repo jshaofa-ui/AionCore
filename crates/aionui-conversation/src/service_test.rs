@@ -290,6 +290,9 @@ impl IConversationRepository for MockRepo {
             .find(|r| r.user_id == user_id && r.id == id)
             .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
 
+        if let Some(agent_type) = &updates.agent_type {
+            row.r#type = agent_type.clone();
+        }
         if let Some(name) = &updates.name {
             row.name = name.clone();
         }
@@ -9974,4 +9977,222 @@ mod session_mentions_integration {
             );
         }
     }
+}
+
+async fn seed_sync_assistant(
+    repo: &SqliteAssistantDefinitionRepository,
+    agent: &str,
+    model: Option<&str>,
+    rules_skill: &str,
+) {
+    repo.upsert(&UpsertAssistantDefinitionParams {
+        id: "sync-definition",
+        assistant_id: "sync-assistant",
+        source: "builtin",
+        owner_type: "system",
+        source_ref: None,
+        name: "Sync Assistant",
+        name_i18n: "{}",
+        description: None,
+        description_i18n: "{}",
+        avatar_type: "emoji",
+        avatar_value: None,
+        agent_id: agent,
+        rule_resource_type: "builtin_asset",
+        rule_resource_ref: None,
+        recommended_prompts: "[]",
+        recommended_prompts_i18n: "{}",
+        default_model_mode: if model.is_some() { "fixed" } else { "auto" },
+        default_model_value: model,
+        default_permission_mode: "fixed",
+        default_permission_value: Some("auto"),
+        default_thought_level_mode: "fixed",
+        default_thought_level_value: Some("medium"),
+        default_skills_mode: "fixed",
+        default_skill_ids: rules_skill,
+        custom_skill_names: "[]",
+        default_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "fixed",
+        default_mcp_ids: "[]",
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn team_assistant_sync_replaces_fixed_settings_and_rules_but_preserves_conversation_and_workspace() {
+    let (svc, _events, repo, definitions, _overlay, _preferences) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    seed_sync_assistant(&definitions, "claude", Some("old-model"), r#"["old-skill"]"#).await;
+    svc.with_assistant_dispatcher(Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("sync-assistant".into(), "old rules".into())]),
+    }));
+    let conversation =
+        create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "sync-assistant").await;
+    svc.update_extra(
+        "user_1",
+        &conversation.id,
+        json!({"teamId":"team-sync","slot_id":"same-slot","arbitrary":"preserved"}),
+    )
+    .await
+    .unwrap();
+    let before = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    let old_fp = svc
+        .team_assistant_configuration_fingerprint("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap();
+    seed_sync_assistant(&definitions, "claude", Some("new-model"), r#"["new-skill"]"#).await;
+    svc.with_assistant_dispatcher(Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::from([("sync-assistant".into(), "new rules".into())]),
+    }));
+    let new_fp = svc
+        .team_assistant_configuration_fingerprint("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap();
+    assert_ne!(old_fp, new_fp);
+    assert_eq!(
+        repo.get_assistant_snapshot("user_1", &conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .rules_content,
+        "old rules",
+        "planning a busy member must not mutate its frozen snapshot"
+    );
+    let synced = svc
+        .synchronize_team_assistant_configuration("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(synced.fingerprint), new_fp);
+    let snapshot = repo
+        .get_assistant_snapshot("user_1", &conversation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("auto"));
+    assert_eq!(snapshot.resolved_thought_level_value.as_deref(), Some("medium"));
+    assert_eq!(snapshot.rules_content, "new rules");
+    assert_eq!(snapshot.resolved_skill_ids, r#"["new-skill"]"#);
+    let after = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&after.extra).unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.created_at, before.created_at);
+    assert_eq!(extra["workspace"], conversation.extra["workspace"]);
+    assert_eq!(extra["slot_id"], "same-slot");
+    assert_eq!(extra["arbitrary"], "preserved");
+    assert_eq!(extra["current_model_id"], "new-model");
+    assert_eq!(extra["session_mode"], "auto");
+    assert_eq!(extra["skills"], json!(["new-skill"]));
+    let again = svc
+        .synchronize_team_assistant_configuration("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(again.fingerprint), new_fp, "identical saves are idempotent");
+}
+
+#[tokio::test]
+async fn team_assistant_sync_changes_engine_and_can_clear_rules_without_reusing_a_foreign_anchor() {
+    let (svc, _events, repo, definitions, _overlay, _preferences) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    seed_sync_assistant(&definitions, "632f31d2", None, "[]").await;
+    let conversation =
+        create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "sync-assistant").await;
+    svc.update_extra(
+        "user_1",
+        &conversation.id,
+        json!({"teamId":"team-sync","session_id":"foreign-anchor","preset_rules":"old rule"}),
+    )
+    .await
+    .unwrap();
+    seed_sync_assistant(&definitions, "codex", Some("new-model"), "[]").await;
+    svc.synchronize_team_assistant_configuration("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap();
+    let row = repo.get("user_1", &conversation.id).await.unwrap().unwrap();
+    assert_eq!(row.r#type, "acp");
+    assert!(row.model.is_none());
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["backend"], "codex");
+    assert!(extra.get("session_id").is_none());
+    assert_eq!(extra["preset_context"], "");
+    assert!(extra["preset_rules"].is_null());
+    assert_eq!(
+        repo.get_assistant_snapshot("user_1", &conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .rules_content,
+        ""
+    );
+}
+
+#[tokio::test]
+async fn team_assistant_sync_rejects_foreign_owner_and_ordinary_conversations() {
+    let (svc, _events, repo, definitions, _overlay, _preferences) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    seed_sync_assistant(&definitions, "codex", Some("model"), "[]").await;
+    let conversation =
+        create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "sync-assistant").await;
+    assert!(matches!(
+        svc.synchronize_team_assistant_configuration("foreign-owner", &conversation.id, "sync-assistant")
+            .await,
+        Err(ConversationError::NotFound { .. })
+    ));
+    assert!(
+        matches!(svc.synchronize_team_assistant_configuration("user_1", &conversation.id, "sync-assistant").await, Err(ConversationError::BadRequest { reason }) if reason == "Assistant synchronization requires a Team conversation")
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&repo.get("user_1", &conversation.id).await.unwrap().unwrap().extra)
+            .unwrap()
+            .get("assistant_configuration_fingerprint")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn team_assistant_model_sync_preserves_resume_and_uses_canonical_effort_storage() {
+    let acp = Arc::new(StubAcpSessionRepo::with_session_id("existing-session"));
+    let (svc, _events, _repo, _tasks) =
+        make_service_with_resolver_and_acp_session_repo(Arc::new(FixedSkillResolver { names: vec![] }), acp.clone());
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let definitions = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    svc.with_assistant_definition_repo(definitions.clone());
+    svc.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone())));
+    svc.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone())));
+    seed_sync_assistant(&definitions, "codex", Some("model-old"), "[]").await;
+    let conversation =
+        create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "sync-assistant").await;
+    svc.update_extra("user_1", &conversation.id, json!({"teamId":"team-sync"}))
+        .await
+        .unwrap();
+    seed_sync_assistant(&definitions, "codex", Some("model-new"), "[]").await;
+    svc.synchronize_team_assistant_configuration("user_1", &conversation.id, "sync-assistant")
+        .await
+        .unwrap();
+    assert_eq!(
+        acp.session_id.lock().unwrap().as_deref(),
+        Some("existing-session"),
+        "model/mode changes must not discard the backend conversation"
+    );
+    let saves = acp.runtime_state_saves();
+    let choices: serde_json::Value = serde_json::from_str(
+        saves
+            .last()
+            .unwrap()
+            .config_selections_json
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        choices["effort"], "medium",
+        "SessionAgent canonical persisted effort key"
+    );
+    assert!(choices.get("thought_level").is_none());
 }

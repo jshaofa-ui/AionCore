@@ -1062,6 +1062,9 @@ impl ConversationService {
                     .and_then(|value| value.as_str().map(ToOwned::to_owned))
             });
         let assistant_locale = req.assistant.as_ref().and_then(|assistant| assistant.locale.clone());
+        if let Some(locale) = assistant_locale.as_deref() {
+            extra["assistant_locale"] = serde_json::Value::String(locale.to_owned());
+        }
         let assistant_overrides = req
             .assistant
             .clone()
@@ -2385,6 +2388,7 @@ impl ConversationService {
         };
 
         let updates = ConversationRowUpdate {
+            agent_type: None,
             name: req.name,
             pinned: req.pinned,
             pinned_at,
@@ -6333,3 +6337,6 @@ mod tests {
         assert!(!policy.sse);
     }
 }
+
+#[path = "assistant_sync.rs"]
+mod assistant_sync;

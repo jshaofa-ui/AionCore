@@ -76,6 +76,29 @@ impl TeammateManager {
         Ok(())
     }
 
+    pub(crate) async fn update_agent_runtime_binding(
+        &self,
+        slot_id: &str,
+        backend: &str,
+        model: Option<&str>,
+    ) -> Result<TeamAgent, TeamError> {
+        let mut slots = self.slots.lock().await;
+        let slot = slots
+            .get_mut(slot_id)
+            .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
+        if slot.agent.backend != backend {
+            slot.agent.model = String::new();
+            slot.agent.conversation_type = None;
+            slot.agent.cli_path = None;
+        }
+        slot.agent.backend = backend.to_owned();
+        if let Some(model) = model {
+            slot.agent.model = model.to_owned();
+        }
+        slot.needs_role_prompt = true;
+        Ok(slot.agent.clone())
+    }
+
     pub async fn update_agent_model(&self, slot_id: &str, model: &str) -> Result<(), TeamError> {
         let mut slots = self.slots.lock().await;
         let slot = slots

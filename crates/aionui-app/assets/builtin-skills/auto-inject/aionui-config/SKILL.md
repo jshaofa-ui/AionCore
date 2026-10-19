@@ -68,23 +68,23 @@ rules or defaults.
 
 ## Assistant Change Timing
 
-AionUi persists assistant configuration immediately, but running conversations
-may keep the assistant snapshot created when the conversation started. Use this
-timing model when reporting successful assistant changes:
+AionUi saves assistant settings immediately. Ordinary standalone conversations
+keep their existing snapshots; new standalone conversations inherit the template.
+Associated Team members synchronize automatically:
 
-- Identity fields such as name, description, avatar, and recommended prompts are
-  saved immediately. If the open UI still shows old values, tell the user to
-  refresh or reopen the assistant view.
-- Runtime fields such as agent, default model, default permission, default
-  skills, default MCPs, thought level, and rules apply to new conversations
-  created from that assistant. Do not claim they change the current running
-  conversation.
-- Skills and MCP defaults are not retroactively injected into the current agent
-  runtime. If a tool is already available in the current conversation, it can be
-  used; otherwise the user should start a new conversation with the assistant.
+- Ready idle members reload at once; active turns finish before reloading.
+- Dormant members load the latest settings on their next normal start. Do not
+  wake a model just to synchronize configuration.
+- Fixed template settings replace stale member selections. Auto model,
+  permission and thought settings retain that member's effective selection.
+- Engine, rules or skills changes may open a new backend context. Model and
+  permission-only changes preserve the compatible backend resume anchor.
+- Team slot/conversation identity, tasks, visible messages and files are retained.
+- Report saved, waiting for idle/start, synchronized and failed separately.
+  Saving/read-back alone does not prove a running member has applied the change.
 
-When reporting a successful runtime-field change, say that the change was saved
-and read back, then state that it will affect new conversations only.
+When a user asks about effect timing, distinguish standalone conversations from
+Team members. Do not instruct removal/re-adding as the normal synchronization path.
 
 ## Assistants
 
@@ -147,7 +147,7 @@ For `name`, `description`, `avatar`, or recommended prompt changes, report that
 the change is saved and may require refreshing or reopening the UI to see. For
 `agent_id`, `defaults`, `enabled_skills`, or other runtime defaults (MCP
 defaults are set via `defaults.mcps`, not `default_mcp_ids`), report that the
-saved change applies to new conversations only.
+saved change applies to new standalone conversations and synchronizes associated Team members at a safe boundary.
 
 Enable, disable, or reorder an assistant:
 
@@ -192,9 +192,7 @@ For rule edits, preserve the user's existing useful instructions unless the
 user explicitly asks to replace them.
 
 After a successful rule write or delete, always tell the user that the rule was
-saved and read back, but it applies only to new conversations created from this
-assistant. The current conversation continues using the rule snapshot it started
-with.
+saved and read back. New standalone conversations inherit it; associated Team members reload after active work ends. Verify the member reload result before claiming it is applied.
 
 ## Skills
 
@@ -238,9 +236,7 @@ JSON
 Do not append blindly. Read the assistant first, merge the list locally, then
 send the full intended `enabled_skills` value.
 
-Enabled skills are assistant defaults for new conversations. Do not tell the
-user that newly attached skills are available in the current conversation unless
-the current runtime already exposes them.
+Enabled skills affect new standalone conversations and associated Team members after their configuration reload. Verify the current runtime tool list before claiming a newly attached skill is available.
 
 Manage external skill paths:
 

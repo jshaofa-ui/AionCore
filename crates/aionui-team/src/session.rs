@@ -2309,17 +2309,33 @@ async fn attach_member_runtime_inner(
         "team member runtime attach started"
     );
 
-    let attach_result = TeamSession::attach_spawned_agent_process(
-        &service,
-        &agent,
-        session.mcp_stdio_config(&agent.slot_id),
-        &user_id,
-        &task_manager,
-        kill_existing,
-    )
+    let mut agent = agent;
+    let attach_result = async {
+        // Drain the old process before changing persisted identity. A late write
+        // from that process must never overwrite the new model or resume anchor.
+        if kill_existing {
+            task_manager
+                .kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild))
+                .await;
+        }
+        let (refreshed, configuration_fingerprint) =
+            service.synchronize_member_assistant(&session, &user_id, &agent).await?;
+        agent = refreshed;
+        let mcp_fingerprint = TeamSession::attach_spawned_agent_process(
+            &service,
+            &agent,
+            session.mcp_stdio_config(&agent.slot_id),
+            &user_id,
+            &task_manager,
+            false,
+        )
+        .await?;
+        Ok::<_, TeamError>(configuration_fingerprint.or(mcp_fingerprint))
+    }
     .await;
     let mcp_fingerprint = attach_result.as_ref().ok().and_then(|value| value.clone());
     if let Err(error) = attach_result {
+        service.broadcast_assistant_sync_status(&user_id, session.team_id(), &agent, "failed");
         service
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
             .await;
@@ -2462,6 +2478,7 @@ async fn attach_member_runtime_inner(
         .work_coordinator
         .set_runtime_constraint(&agent.slot_id, RuntimeConstraint::Ready);
     if let Some(fingerprint) = mcp_fingerprint {
+        service.broadcast_assistant_sync_status(&user_id, session.team_id(), &agent, "synchronized");
         session
             .work_coordinator
             .complete_mcp_refresh(&agent.slot_id, &fingerprint);

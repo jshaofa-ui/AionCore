@@ -738,3 +738,24 @@ to keep ANSI codes out of captured output.
 Do NOT manually re-implement these behaviours with raw
 `tokio::process::Command` — the centralised builder is the one place to
 update policies (e.g. future `CARGO_*` cleanup, sandbox flags).
+
+
+## Assistant configuration synchronization
+
+Assistant mutations publish `assistant.configurationChanged` after a complete
+editor save (rules and defaults). The owner-scoped Team watcher reuses the
+existing idle-safe MCP reload queue for the full runtime configuration. A
+configuration fingerprint coalesces duplicate updates; identity-only changes
+are excluded. Active work retains its frozen snapshot; dormant members refresh
+on normal attach without generating a model turn.
+
+The conversation domain resolves and persists current engine/defaults/rules/
+skills. Team provisioning retains the member slot and conversation IDs and
+updates runtime bindings under the existing attach/restart lease. Compatible
+model/mode changes retain resume; engine/rules/skills changes reset the backend
+anchor while preserving visible history, tasks, and files. Production logs and
+`team.assistantConfigurationSync` report reload state without prompt or key data.
+
+Foundation impact: the internal conversation row patch now supports changing its
+agent type, with the same owner-scoped repository update. No schema migration,
+authentication bypass, new public type-patch endpoint, or raw live SQL is added.

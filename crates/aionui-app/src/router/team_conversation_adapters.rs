@@ -436,6 +436,29 @@ impl TeamProjectionMessageStore for TeamConversationAdapters {
 
 #[async_trait]
 impl TeamConversationProvisioningPort for TeamConversationAdapters {
+    async fn assistant_configuration_fingerprint(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<String>, TeamError> {
+        self.conversation_service
+            .team_assistant_configuration_fingerprint(user_id, conversation_id, assistant_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+    async fn synchronize_assistant_configuration(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<aionui_api_types::TeamAssistantConfiguration>, TeamError> {
+        self.conversation_service
+            .synchronize_team_assistant_configuration(user_id, conversation_id, assistant_id)
+            .await
+            .map_err(map_conversation_update_error)
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,

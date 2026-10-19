@@ -1080,6 +1080,7 @@ pub(crate) mod workspace_harness {
                     &user_id,
                     conversation_id,
                     &ConversationRowUpdate {
+                        agent_type: None,
                         name: None,
                         model: None,
                         pinned: None,

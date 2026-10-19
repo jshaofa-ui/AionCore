@@ -326,6 +326,95 @@ impl TeamSessionService {
         )
     }
 
+    pub(crate) fn broadcast_assistant_sync_status(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        agent: &TeamAgent,
+        status: &str,
+    ) {
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "team.assistantConfigurationSync",
+            serde_json::json!({
+                "user_id": user_id, "team_id": team_id, "slot_id": agent.slot_id,
+                "assistant_id": agent.assistant_id, "member_name": agent.name, "status": status,
+            }),
+        ));
+    }
+
+    pub(crate) async fn synchronize_member_assistant(
+        &self,
+        session: &Arc<TeamSession>,
+        user_id: &str,
+        agent: &TeamAgent,
+    ) -> Result<(TeamAgent, Option<String>), TeamError> {
+        // Serialize with add/remove/rename/model mutations, and merge only this
+        // binding into the latest persisted roster. A scheduler snapshot can lag
+        // a membership write and must never replace the whole team in storage.
+        let lock = self
+            .add_agent_locks
+            .entry(session.team_id().to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let mut current = self.load_owned_team(user_id, session.team_id()).await?;
+        let persisted = current
+            .agents
+            .iter_mut()
+            .find(|member| member.slot_id == agent.slot_id && member.conversation_id == agent.conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(agent.slot_id.clone()))?;
+        let Some(configuration) = self
+            .provisioner()
+            .synchronize_assistant_configuration(user_id, persisted)
+            .await?
+        else {
+            return Ok((agent.clone(), None));
+        };
+        let refreshed = session
+            .scheduler()
+            .update_agent_runtime_binding(&agent.slot_id, &configuration.backend, configuration.model.as_deref())
+            .await?;
+        persisted.backend = configuration.backend;
+        if let Some(model) = configuration.model {
+            persisted.model = model;
+        }
+        self.provisioner()
+            .persist_agents(session.team_id(), &current.agents)
+            .await?;
+        self.broadcast_team_list_changed(user_id, session.team_id(), "updated");
+        Ok((refreshed, Some(configuration.fingerprint)))
+    }
+
+    pub async fn handle_assistant_configuration_changed(&self, event: aionui_api_types::AssistantConfigurationChanged) {
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.session.user_id() == event.user_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .collect::<Vec<_>>();
+        for session in sessions {
+            for agent in session
+                .scheduler()
+                .list_agents()
+                .await
+                .into_iter()
+                .filter(|a| a.assistant_id.as_deref() == Some(event.assistant_id.as_str()))
+            {
+                if let Some(locale) = event.locale.as_deref()
+                    && let Err(error) = self
+                        .conversation_port
+                        .patch_runtime_config(&agent.conversation_id, serde_json::json!({"assistant_locale":locale}))
+                        .await
+                {
+                    warn!(slot_id = agent.slot_id, error = %error, "assistant locale synchronization failed");
+                    self.broadcast_assistant_sync_status(&event.user_id, session.team_id(), &agent, "failed");
+                    continue;
+                }
+                self.refresh_member_mcp_binding(&session, &event.user_id, &agent).await;
+            }
+        }
+    }
+
     /// Apply an assistant MCP binding event to matching members in active team
     /// sessions. Persisted snapshots update immediately; ready idle runtimes are
     /// rebuilt now, while active work records a deferred refresh.
@@ -390,25 +479,33 @@ impl TeamSessionService {
                     error = %error,
                     "assistant MCP snapshot refresh failed"
                 );
+                self.broadcast_assistant_sync_status(user_id, session.team_id(), agent, "failed");
                 return;
             }
         };
         match session.member_runtimes().snapshot(&agent.slot_id) {
             MemberRuntimeSnapshot::Absent
             | MemberRuntimeSnapshot::Failed { .. }
-            | MemberRuntimeSnapshot::SessionStopped => {}
+            | MemberRuntimeSnapshot::SessionStopped => {
+                self.broadcast_assistant_sync_status(user_id, session.team_id(), agent, "waiting_start");
+            }
             MemberRuntimeSnapshot::Attaching { .. } | MemberRuntimeSnapshot::Removing { .. } => {
                 session
                     .work_coordinator()
                     .defer_mcp_refresh(&agent.slot_id, &fingerprint);
+                self.broadcast_assistant_sync_status(user_id, session.team_id(), agent, "waiting_idle");
             }
             MemberRuntimeSnapshot::Ready => {
                 match session
                     .work_coordinator()
                     .request_mcp_refresh(&agent.slot_id, &fingerprint)
                 {
-                    McpRefreshDisposition::Unchanged | McpRefreshDisposition::Deferred => {}
+                    McpRefreshDisposition::Unchanged => {}
+                    McpRefreshDisposition::Deferred => {
+                        self.broadcast_assistant_sync_status(user_id, session.team_id(), agent, "waiting_idle");
+                    }
                     McpRefreshDisposition::RestartNow => {
+                        self.broadcast_assistant_sync_status(user_id, session.team_id(), agent, "synchronizing");
                         if let Err(error) = self
                             .restart_agent_runtime_for_mcp_refresh(user_id, session.team_id(), &agent.slot_id)
                             .await

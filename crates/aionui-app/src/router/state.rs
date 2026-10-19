@@ -856,6 +856,7 @@ fn spawn_assistant_mcp_binding_watcher(
 ) {
     enum McpBindingWork {
         Changed(aionui_api_types::AssistantMcpBindingChanged),
+        ConfigurationChanged(aionui_api_types::AssistantConfigurationChanged),
         ReconcileAll,
     }
 
@@ -865,6 +866,9 @@ fn spawn_assistant_mcp_binding_watcher(
         while let Some(work) = work_rx.recv().await {
             match work {
                 McpBindingWork::Changed(payload) => service.handle_assistant_mcp_binding_changed(payload).await,
+                McpBindingWork::ConfigurationChanged(payload) => {
+                    service.handle_assistant_configuration_changed(payload).await
+                }
                 McpBindingWork::ReconcileAll => service.reconcile_all_assistant_mcp_bindings().await,
             }
         }
@@ -873,6 +877,15 @@ fn spawn_assistant_mcp_binding_watcher(
     tokio::spawn(async move {
         loop {
             let work = match event_rx.recv().await {
+                Ok(event) if event.name == aionui_api_types::ASSISTANT_CONFIGURATION_CHANGED_EVENT => {
+                    match serde_json::from_value::<aionui_api_types::AssistantConfigurationChanged>(event.data) {
+                        Ok(payload) => McpBindingWork::ConfigurationChanged(payload),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "invalid assistant configuration event");
+                            continue;
+                        }
+                    }
+                }
                 Ok(event) if event.name == aionui_api_types::ASSISTANT_MCP_BINDING_CHANGED_EVENT => {
                     match serde_json::from_value::<aionui_api_types::AssistantMcpBindingChanged>(event.data) {
                         Ok(payload) => McpBindingWork::Changed(payload),

@@ -242,3 +242,7 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub use assistant::{ASSISTANT_CONFIGURATION_CHANGED_EVENT, AssistantConfigurationChanged, TeamAssistantConfiguration};
+
+pub use assistant::{AssistantRuleUpdate, TeamAssistantConfigurationSync};

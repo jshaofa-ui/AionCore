@@ -1063,19 +1063,51 @@ impl AssistantService {
     // Create / Update / Delete
     // -----------------------------------------------------------------------
 
+    async fn finish_assistant_update(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+        mcp_changed: bool,
+        rule: Option<aionui_api_types::AssistantRuleUpdate>,
+    ) -> Result<AssistantResponse, AssistantError> {
+        let locale = rule.as_ref().and_then(|rule| rule.locale.as_deref());
+        if let Some(rule) = rule.as_ref() {
+            self.save_rule_for_user(user_id, assistant_id, rule.locale.as_deref(), &rule.content)
+                .await?;
+        }
+        self.finish_assistant_mutation(user_id, assistant_id, mcp_changed, locale)
+            .await
+    }
+
     async fn finish_assistant_mutation(
         &self,
         user_id: &str,
         assistant_id: &str,
         publish_mcp_change: bool,
+        locale: Option<&str>,
     ) -> Result<AssistantResponse, AssistantError> {
         let response = self.get_for_user(user_id, assistant_id).await?;
+        self.publish_configuration_changed(user_id, assistant_id, locale);
         if publish_mcp_change
             && let Err(error) = self.publish_assistant_mcp_binding_changed(user_id, assistant_id).await
         {
             warn!(user_id, assistant_id, error = %error, "failed to publish assistant MCP binding change");
         }
         Ok(response)
+    }
+
+    fn publish_configuration_changed(&self, user_id: &str, assistant_id: &str, locale: Option<&str>) {
+        if let Some(broadcaster) = self
+            .event_broadcaster
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+        {
+            broadcaster.broadcast(WebSocketMessage::new(
+                aionui_api_types::ASSISTANT_CONFIGURATION_CHANGED_EVENT,
+                serde_json::json!({ "user_id": user_id, "assistant_id": assistant_id, "locale": locale }),
+            ));
+        }
     }
 
     async fn publish_assistant_mcp_binding_changed(
@@ -1187,7 +1219,7 @@ impl AssistantService {
             self.sync_preferences_from_defaults_request_for_user(user_id, &definition, None, req.defaults.as_ref())
                 .await?;
         }
-        self.finish_assistant_mutation(user_id, &id, true).await
+        self.finish_assistant_mutation(user_id, &id, true, None).await
     }
 
     pub async fn update(&self, id: &str, req: UpdateAssistantRequest) -> Result<AssistantResponse, AssistantError> {
@@ -1201,6 +1233,7 @@ impl AssistantService {
         req: UpdateAssistantRequest,
     ) -> Result<AssistantResponse, AssistantError> {
         let mcp_binding_changed = req.defaults.as_ref().is_some_and(|defaults| defaults.mcps.is_some());
+        let rule_update = req.rule_update.clone();
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => {
                 let detail_overrides = SerializedDetailOverrides::from_update(&req)?;
@@ -1214,7 +1247,8 @@ impl AssistantService {
                 // product-defined governance allows model/permission/thought
                 // defaults to vary per built-in assistant. Any other field on the
                 // request is rejected so callers don't silently lose data.
-                if req.name.is_some()
+                if req.rule_update.is_some()
+                    || req.name.is_some()
                     || req.description.is_some()
                     || req.avatar.is_some()
                     || req.enabled_skills.is_some()
@@ -1288,7 +1322,9 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return self
+                    .finish_assistant_update(user_id, id, mcp_binding_changed, rule_update)
+                    .await;
             }
             AssistantSource::Generated => {
                 if req.name.is_some()
@@ -1349,7 +1385,9 @@ impl AssistantService {
                     req.defaults.as_ref(),
                 )
                 .await?;
-                return self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await;
+                return self
+                    .finish_assistant_update(user_id, id, mcp_binding_changed, rule_update)
+                    .await;
             }
             AssistantSource::User => {}
         }
@@ -1409,7 +1447,8 @@ impl AssistantService {
             )
             .await?;
         }
-        self.finish_assistant_mutation(user_id, id, mcp_binding_changed).await
+        self.finish_assistant_update(user_id, id, mcp_binding_changed, rule_update)
+            .await
     }
 
     async fn sync_preferences_from_defaults_request_for_user(
@@ -1964,6 +2003,18 @@ impl AssistantService {
         locale: Option<&str>,
         content: &str,
     ) -> Result<(), AssistantError> {
+        self.save_rule_for_user(user_id, id, locale, content).await?;
+        self.publish_configuration_changed(user_id, id, locale);
+        Ok(())
+    }
+
+    async fn save_rule_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        locale: Option<&str>,
+        content: &str,
+    ) -> Result<(), AssistantError> {
         match self.classify_source_for_user(user_id, id).await {
             AssistantSource::Builtin => Err(AssistantError::BadRequest(
                 "Cannot write rule for built-in assistant".into(),
@@ -1992,7 +2043,11 @@ impl AssistantService {
                 "Cannot delete rule for built-in assistant".into(),
             )),
             AssistantSource::Generated | AssistantSource::User => {
-                Ok(remove_assistant_md_files(&self.user_rules_dir_for_user(user_id), id))
+                let removed = remove_assistant_md_files(&self.user_rules_dir_for_user(user_id), id);
+                if removed {
+                    self.publish_configuration_changed(user_id, id, None);
+                }
+                Ok(removed)
             }
         }
     }
@@ -6014,6 +6069,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn combined_editor_save_publishes_only_after_rules_are_readable() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("combined-save".into()),
+                name: "Combined".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let bus = Arc::new(BroadcastEventBus::new(16));
+        let mut events = bus.subscribe();
+        fx.service.with_event_broadcaster(bus);
+        fx.service
+            .update(
+                "combined-save",
+                UpdateAssistantRequest {
+                    rule_update: Some(aionui_api_types::AssistantRuleUpdate {
+                        locale: Some("zh-CN".into()),
+                        content: "new saved rules".into(),
+                    }),
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("new-model".into()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.name, "assistant.configurationChanged");
+        assert_eq!(event.data["locale"], "zh-CN");
+        assert_eq!(
+            fx.service.read_rule("combined-save", Some("zh-CN")).await.unwrap(),
+            "new saved rules"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "one completed form save produces one configuration notification"
+        );
+        assert!(fx.service.delete_rule("combined-save").await.unwrap());
+        assert_eq!(events.try_recv().unwrap().name, "assistant.configurationChanged");
+    }
+
+    #[tokio::test]
+    async fn model_only_update_and_rule_write_notify_existing_team_members() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("configuration-events".into()),
+                name: "Configuration Events".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let bus = Arc::new(BroadcastEventBus::new(16));
+        let mut events = bus.subscribe();
+        fx.service.with_event_broadcaster(bus);
+        fx.service
+            .update(
+                "configuration-events",
+                UpdateAssistantRequest {
+                    defaults: Some(AssistantDefaultsRequest {
+                        model: Some(AssistantDefaultScalarRequest {
+                            mode: "fixed".into(),
+                            value: Some("model-new".into()),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let event = events
+            .try_recv()
+            .expect("model-only edits must notify existing members");
+        assert_eq!(event.name, "assistant.configurationChanged");
+        assert_eq!(event.data["assistant_id"], "configuration-events");
+        fx.service
+            .write_rule("configuration-events", Some("zh-CN"), "new rules")
+            .await
+            .unwrap();
+        let event = events
+            .try_recv()
+            .expect("rule edits must notify existing members after the file is saved");
+        assert_eq!(event.name, "assistant.configurationChanged");
+        assert_eq!(event.data["assistant_id"], "configuration-events");
+    }
+
+    #[tokio::test]
     async fn create_and_update_publish_effective_mcp_binding_fingerprints() {
         let fx = fixture().await;
         let event_bus = Arc::new(BroadcastEventBus::new(8));
@@ -6035,7 +6185,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let created = events.recv().await.unwrap();
+        let mut created = events.recv().await.unwrap();
+        while created.name != ASSISTANT_MCP_BINDING_CHANGED_EVENT {
+            created = events.recv().await.unwrap();
+        }
         let created: AssistantMcpBindingChanged = serde_json::from_value(created.data).unwrap();
         assert_eq!(created.fingerprint, "[]");
 
@@ -6055,7 +6208,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let updated = events.recv().await.unwrap();
+        let mut updated = events.recv().await.unwrap();
+        while updated.name != ASSISTANT_MCP_BINDING_CHANGED_EVENT {
+            updated = events.recv().await.unwrap();
+        }
         let updated: AssistantMcpBindingChanged = serde_json::from_value(updated.data).unwrap();
         assert_eq!(updated.fingerprint, r#"["mcp-a","mcp-b"]"#);
     }

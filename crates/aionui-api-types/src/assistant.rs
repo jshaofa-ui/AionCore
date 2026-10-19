@@ -20,6 +20,25 @@ pub struct AssistantMcpBindingChanged {
     pub fingerprint: String,
 }
 
+/// Emitted only after a persisted assistant edit (including rule edits).
+pub const ASSISTANT_CONFIGURATION_CHANGED_EVENT: &str = "assistant.configurationChanged";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantConfigurationChanged {
+    #[serde(default)]
+    pub locale: Option<String>,
+    pub user_id: String,
+    pub assistant_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamAssistantConfiguration {
+    pub fingerprint: String,
+    pub name: String,
+    pub backend: String,
+    pub model: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Response + source enum
 // ---------------------------------------------------------------------------
@@ -328,6 +347,10 @@ pub struct CreateAssistantRequest {
 /// `PUT /api/assistants/{id}`. All fields optional; partial update semantics.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UpdateAssistantRequest {
+    /// Saved before publishing the configuration event, so a full editor save
+    /// cannot rebuild a member between its defaults and rules requests.
+    #[serde(default)]
+    pub rule_update: Option<AssistantRuleUpdate>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -595,4 +618,21 @@ mod tests {
             "camelCase lastUsedAt must NOT alias into last_used_at"
         );
     }
+}
+
+/// Owner-scoped progress for a member configuration reload. No prompts or keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamAssistantConfigurationSync {
+    pub member_name: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub slot_id: String,
+    pub assistant_id: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssistantRuleUpdate {
+    pub locale: Option<String>,
+    pub content: String,
 }

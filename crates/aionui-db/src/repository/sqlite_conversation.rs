@@ -346,6 +346,10 @@ impl IConversationRepository for SqliteConversationRepository {
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
 
+        if let Some(ref agent_type) = updates.agent_type {
+            set_parts.push("type = ?".to_string());
+            binds.push(BindValue::Str(agent_type.clone()));
+        }
         if let Some(ref name) = updates.name {
             set_parts.push("name = ?".to_string());
             binds.push(BindValue::Str(name.clone()));

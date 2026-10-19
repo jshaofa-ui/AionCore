@@ -449,6 +449,8 @@ pub struct MentionableCandidatesParams {
 /// `None` = keep existing value; `Some(v)` = set to `v`.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationRowUpdate {
+    /// Internal runtime rebinding; never exposed as an arbitrary client patch.
+    pub agent_type: Option<String>,
     pub name: Option<String>,
     pub pinned: Option<bool>,
     pub pinned_at: Option<Option<TimestampMs>>,

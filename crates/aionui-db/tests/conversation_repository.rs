@@ -1463,3 +1463,40 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
         .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
 }
+
+#[tokio::test]
+async fn runtime_rebinding_preserves_messages_and_enforces_owner_scope() {
+    let (repo, _db) = setup().await;
+    let row = make_conversation("runtime-rebind");
+    repo.create(&row).await.unwrap();
+    let message = make_message(&row.id, "retained history");
+    repo.insert_message(USER_ID, &message).await.unwrap();
+    let update = ConversationRowUpdate {
+        agent_type: Some("acp".into()),
+        model: Some(None),
+        ..Default::default()
+    };
+    assert!(matches!(
+        repo.update("foreign-owner", &row.id, &update).await,
+        Err(DbError::NotFound(_))
+    ));
+    repo.update(USER_ID, &row.id, &update).await.unwrap();
+    let current = repo.get(USER_ID, &row.id).await.unwrap().unwrap();
+    assert_eq!(current.r#type, "acp");
+    assert!(current.model.is_none());
+    assert_eq!(current.created_at, row.created_at);
+    assert_eq!(current.extra, row.extra);
+    let messages = repo
+        .list_messages_page(
+            USER_ID,
+            &row.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.items.len(), 1);
+    assert_eq!(messages.items[0].id, message.id);
+}

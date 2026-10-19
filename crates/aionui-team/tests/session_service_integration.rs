@@ -349,6 +349,7 @@ struct FakeConversationPorts {
     workspace_root: std::path::PathBuf,
     preset_snapshots: Mutex<HashMap<String, FakePresetAssistantSnapshot>>,
     assistant_mcp_selections: Mutex<HashMap<String, TeamMcpSelection>>,
+    configurations: Mutex<HashMap<String, aionui_api_types::TeamAssistantConfiguration>>,
     /// `(conversation_id, option_id, requested_value)` per `set_config_option`.
     config_option_calls: Mutex<Vec<(String, String, String)>>,
     fail_team_temp_create: std::sync::atomic::AtomicBool,
@@ -371,6 +372,7 @@ impl FakeConversationPorts {
             workspace_root,
             preset_snapshots: Mutex::new(HashMap::new()),
             assistant_mcp_selections: Mutex::new(HashMap::new()),
+            configurations: Mutex::new(HashMap::new()),
             config_option_calls: Mutex::new(Vec::new()),
             fail_team_temp_create: std::sync::atomic::AtomicBool::new(false),
             fail_leader_workspace_patch: std::sync::atomic::AtomicBool::new(false),
@@ -425,6 +427,28 @@ impl FakeConversationPorts {
 
 #[async_trait::async_trait]
 impl TeamConversationProvisioningPort for FakeConversationPorts {
+    async fn assistant_configuration_fingerprint(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<String>, aionui_team::TeamError> {
+        Ok(self
+            .configurations
+            .lock()
+            .unwrap()
+            .get(assistant_id)
+            .map(|c| c.fingerprint.clone()))
+    }
+    async fn synchronize_assistant_configuration(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<aionui_api_types::TeamAssistantConfiguration>, aionui_team::TeamError> {
+        Ok(self.configurations.lock().unwrap().get(assistant_id).cloned())
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
@@ -638,6 +662,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 &user_id,
                 conversation_id,
                 &ConversationRowUpdate {
+                    agent_type: None,
                     name: None,
                     model: None,
                     pinned: None,
@@ -6132,6 +6157,7 @@ async fn ensure_session_repairs_legacy_model_facts_from_confirmed_selection() {
             "user1",
             &worker.conversation_id,
             &ConversationRowUpdate {
+                agent_type: None,
                 extra: Some(serde_json::to_string(&extra).unwrap()),
                 ..Default::default()
             },
@@ -8741,4 +8767,174 @@ async fn activity_rejects_other_user() {
         .await
         .unwrap_err();
     assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn assistant_configuration_change_rebinds_only_matching_member_without_rejoining_or_waking_peers() {
+    let definitions: Arc<dyn IAssistantDefinitionRepository> = Arc::new(PairAssistantDefinitionRepo {
+        rows: vec![word_creator_definition(), reviewer_definition()],
+    });
+    let (svc, _repo, ports, _conversations, task_manager) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        seeded_agent_metadata_repo(),
+        definitions,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Configuration Sync".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: None,
+                        model: "old-model".into(),
+                        assistant_id: Some("word-creator".into()),
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Review".into(),
+                        role: "teammate".into(),
+                        backend: None,
+                        model: "old-model".into(),
+                        assistant_id: Some("reviewer".into()),
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let lead = created.assistants.iter().find(|m| m.role == "lead").unwrap();
+    let peer = created.assistants.iter().find(|m| m.role == "teammate").unwrap();
+    ports.configurations.lock().unwrap().insert(
+        "word-creator".into(),
+        aionui_api_types::TeamAssistantConfiguration {
+            fingerprint: "configuration-2".into(),
+            name: "Template name".into(),
+            backend: "codex".into(),
+            model: Some("new-model".into()),
+        },
+    );
+    task_manager.reset_calls();
+    let event = aionui_api_types::AssistantConfigurationChanged {
+        user_id: "user1".into(),
+        assistant_id: "word-creator".into(),
+        locale: None,
+    };
+    svc.handle_assistant_configuration_changed(event.clone()).await;
+    let current = svc.get_team("user1", &created.id).await.unwrap();
+    let updated = current.assistants.iter().find(|m| m.slot_id == lead.slot_id).unwrap();
+    assert_eq!(updated.conversation_id, lead.conversation_id);
+    assert_eq!(updated.name, "Lead");
+    assert_eq!(updated.backend, "codex");
+    assert_eq!(updated.model, "new-model");
+    assert!(
+        !task_manager.snapshot().build.contains(&peer.conversation_id),
+        "unrelated members remain dormant"
+    );
+    task_manager.reset_calls();
+    svc.handle_assistant_configuration_changed(event).await;
+    assert!(
+        task_manager.snapshot().build.is_empty(),
+        "same revision must not rebuild again"
+    );
+}
+
+#[tokio::test]
+async fn assistant_sync_preserves_latest_persisted_membership_instead_of_scheduler_snapshot() {
+    let definitions: Arc<dyn IAssistantDefinitionRepository> = Arc::new(PairAssistantDefinitionRepo {
+        rows: vec![word_creator_definition(), reviewer_definition()],
+    });
+    let (svc, repo, ports, _conversations, task_manager) = setup_with_ports_metadata_assistants_and_conversation_repo(
+        success_factory(),
+        seeded_agent_metadata_repo(),
+        definitions,
+        Arc::new(EmptyAssistantOverlayRepo),
+    );
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Configuration Sync".into(),
+                agents: vec![
+                    TeamAgentInput {
+                        name: "Lead".into(),
+                        role: "lead".into(),
+                        backend: None,
+                        model: "old-model".into(),
+                        assistant_id: Some("word-creator".into()),
+                        conversation_id: None,
+                    },
+                    TeamAgentInput {
+                        name: "Review".into(),
+                        role: "teammate".into(),
+                        backend: None,
+                        model: "old-model".into(),
+                        assistant_id: Some("reviewer".into()),
+                        conversation_id: None,
+                    },
+                ],
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let lead = created.assistants.iter().find(|m| m.role == "lead").unwrap();
+    let peer = created.assistants.iter().find(|m| m.role == "teammate").unwrap();
+    ports.configurations.lock().unwrap().insert(
+        "word-creator".into(),
+        aionui_api_types::TeamAssistantConfiguration {
+            fingerprint: "configuration-2".into(),
+            name: "Template name".into(),
+            backend: "codex".into(),
+            model: Some("new-model".into()),
+        },
+    );
+    // A membership mutation can persist before publishing its scheduler update.
+    // Synchronization must merge only its member into that latest persisted roster.
+    let row = repo.get_team("user1", &created.id).await.unwrap().unwrap();
+    let mut agents: Vec<aionui_team::types::TeamAgent> = serde_json::from_str(&row.agents).unwrap();
+    let mut added = agents.iter().find(|m| m.slot_id == peer.slot_id).unwrap().clone();
+    agents.retain(|m| m.slot_id != peer.slot_id);
+    added.slot_id = "concurrently-added-slot".into();
+    added.name = "Concurrent member".into();
+    added.conversation_id = "concurrently-added-conversation".into();
+    agents.push(added);
+    repo.update_team(
+        "user1",
+        &created.id,
+        &aionui_db::UpdateTeamParams {
+            agents: Some(serde_json::to_string(&agents).unwrap()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    task_manager.reset_calls();
+    svc.restart_agent_runtime("user1", &created.id, &lead.slot_id)
+        .await
+        .unwrap();
+    let current = svc.get_team("user1", &created.id).await.unwrap();
+    let updated = current.assistants.iter().find(|m| m.slot_id == lead.slot_id).unwrap();
+    assert_eq!(updated.conversation_id, lead.conversation_id);
+    assert_eq!(updated.name, "Lead");
+    assert_eq!(updated.backend, "codex");
+    assert_eq!(updated.model, "new-model");
+    assert!(
+        current
+            .assistants
+            .iter()
+            .any(|m| m.slot_id == "concurrently-added-slot")
+    );
+    assert!(!current.assistants.iter().any(|m| m.slot_id == peer.slot_id));
+    assert!(
+        !task_manager.snapshot().build.contains(&peer.conversation_id),
+        "unrelated members remain dormant"
+    );
 }
