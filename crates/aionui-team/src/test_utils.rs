@@ -614,6 +614,7 @@ pub(crate) mod workspace_harness {
 
     pub(crate) struct FullMockTeamRepo {
         teams: Mutex<Vec<TeamRow>>,
+        tasks: Mutex<Vec<TeamTaskRow>>,
         messages: Mutex<Vec<aionui_db::models::MailboxMessageRow>>,
     }
 
@@ -621,6 +622,7 @@ pub(crate) mod workspace_harness {
         fn new() -> Self {
             Self {
                 teams: Mutex::new(Vec::new()),
+                tasks: Mutex::new(Vec::new()),
                 messages: Mutex::new(Vec::new()),
             }
         }
@@ -838,31 +840,53 @@ pub(crate) mod workspace_harness {
             Ok(())
         }
 
-        async fn create_task(&self, _user_id: &str, _row: &TeamTaskRow) -> Result<(), DbError> {
+        async fn create_task(&self, _user_id: &str, row: &TeamTaskRow) -> Result<(), DbError> {
+            self.tasks.lock().unwrap().push(row.clone());
             Ok(())
         }
-
         async fn find_task_by_id(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _task_id: &str,
+            team_id: &str,
+            task_id: &str,
         ) -> Result<Option<TeamTaskRow>, DbError> {
-            Ok(None)
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.team_id == team_id && t.id == task_id)
+                .cloned())
         }
-
         async fn update_task(
             &self,
             _user_id: &str,
-            _team_id: &str,
-            _task_id: &str,
-            _params: &aionui_db::UpdateTaskParams,
+            team_id: &str,
+            task_id: &str,
+            params: &aionui_db::UpdateTaskParams,
         ) -> Result<(), DbError> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks
+                .iter_mut()
+                .find(|t| t.team_id == team_id && t.id == task_id)
+                .ok_or_else(|| DbError::NotFound(task_id.to_owned()))?;
+            if let Some(status) = &params.status {
+                task.status = status.clone();
+            }
+            if let Some(owner) = &params.owner {
+                task.owner = Some(owner.clone());
+            }
             Ok(())
         }
-
-        async fn list_tasks(&self, _user_id: &str, _team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
-            Ok(vec![])
+        async fn list_tasks(&self, _user_id: &str, team_id: &str) -> Result<Vec<TeamTaskRow>, DbError> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.team_id == team_id)
+                .cloned()
+                .collect())
         }
 
         async fn list_tasks_by_ids(

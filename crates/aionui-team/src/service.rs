@@ -1,6 +1,7 @@
 mod cross_team;
 mod cross_team_policy;
 mod describe_support;
+mod project_cleanup;
 mod response_builder;
 pub(crate) mod spawn_support;
 
@@ -1662,7 +1663,7 @@ impl TeamSessionService {
         // failure), so holding them here would deadlock. Concurrent ensures
         // that were blocked on membership_guard now observe the published
         // session and take the reconciliation path instead of cold-starting.
-        let slow_monitor_handle = Self::spawn_slow_monitor(session.clone());
+        let slow_monitor_handle = Self::spawn_slow_monitor(session.clone(), self.self_ref.clone());
         let entry = SessionEntry {
             session: session.clone(),
             slow_monitor_handle,
@@ -2112,14 +2113,21 @@ impl TeamSessionService {
         self.broadcaster.broadcast(event);
     }
 
-    fn spawn_slow_monitor(session: Arc<TeamSession>) -> tokio::task::JoinHandle<()> {
+    fn spawn_slow_monitor(session: Arc<TeamSession>, service: Weak<TeamSessionService>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let snapshot = session.work_coordinator().snapshot();
                 session.team_run_manager().publish_snapshot_update(&snapshot);
+                if let Some(service) = service.upgrade() {
+                    if let Err(error) = service.process_project_receipts(&session).await {
+                        warn!(team_id=session.team_id(), error=%error, "native project cleanup deferred");
+                    }
+                } else {
+                    break;
+                }
             }
         })
     }
@@ -2875,7 +2883,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<TeamContextResetResponse, TeamError> {
-        self.clear_agent_context_inner(user_id, team_id, slot_id).await
+        self.clear_agent_context_inner(user_id, team_id, slot_id, false).await
     }
 
     /// MCP calls originate from an already-running team session. Keeping this
@@ -2887,7 +2895,7 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
     ) -> Result<TeamContextResetResponse, TeamError> {
-        self.clear_agent_context_inner(user_id, team_id, slot_id).await
+        self.clear_agent_context_inner(user_id, team_id, slot_id, false).await
     }
 
     async fn clear_agent_context_inner(
@@ -2895,6 +2903,7 @@ impl TeamSessionService {
         user_id: &str,
         team_id: &str,
         slot_id: &str,
+        accepted_project_boundary: bool,
     ) -> Result<TeamContextResetResponse, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         let agent = team
@@ -2904,8 +2913,14 @@ impl TeamSessionService {
             .cloned()
             .ok_or_else(|| TeamError::AgentNotFound(slot_id.to_owned()))?;
         let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let mut capability_agent = agent.clone();
+        // Only the authenticated native receipt worker may reset an idle lead.
+        // Public UI/MCP calls keep the existing leader permission boundary.
+        if accepted_project_boundary {
+            capability_agent.role = TeammateRole::Teammate;
+        }
         let capability = self
-            .context_reset_capability_for_session(user_id, &agent, session.as_deref())
+            .context_reset_capability_for_session(user_id, &capability_agent, session.as_deref())
             .await?;
         match capability.availability {
             TeamContextResetAvailability::Ready => {}
@@ -2974,6 +2989,44 @@ impl TeamSessionService {
                 return Err(error);
             }
         };
+
+        if accepted_project_boundary {
+            let tasks = session.scheduler().list_tasks().await;
+            let idle = tasks.as_ref().is_ok_and(|tasks| {
+                !tasks.iter().any(|task| {
+                    matches!(
+                        task.status,
+                        crate::types::TaskStatus::Pending | crate::types::TaskStatus::InProgress
+                    ) && (agent.role == TeammateRole::Lead || task.owner.as_deref() == Some(slot_id))
+                })
+            });
+            if !idle {
+                session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+                return Err(busy_error());
+            }
+        }
+
+        if agent.backend == "aionrs" {
+            let cleared = self
+                .conversation_port
+                .clear_builtin_context(user_id, &agent.conversation_id)
+                .await;
+            let reinjected = match cleared {
+                Ok(()) => session.scheduler().require_role_prompt(slot_id).await,
+                Err(error) => Err(error),
+            };
+            session.work_coordinator().abort_runtime_restart(slot_id, &restart_gate);
+            reinjected?;
+            session
+                .project_context_reset_notice(slot_id, TeamContextResetRuntimeStatus::Ready)
+                .await?;
+            info!(team_id, slot_id, "builtin project context reset persisted and verified");
+            return Ok(TeamContextResetResponse {
+                reset_status: TeamContextResetStatus::Completed,
+                runtime_status: TeamContextResetRuntimeStatus::Ready,
+                preserved_unread_count,
+            });
+        }
 
         let lease = match session.member_runtimes().reserve_restart(slot_id) {
             ReserveAttach::Start(lease) => lease,
@@ -5150,5 +5203,70 @@ mod tests {
             .expect_err("team config options must reject cross-user access");
 
         assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
+    }
+    #[tokio::test]
+    async fn native_receipt_cleanup_waits_for_completed_task_and_is_idempotent() {
+        use crate::task_board::TaskUpdate;
+        use crate::types::TaskStatus;
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _, _, _, _) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let mut request = two_agent_team_request("Native Cleanup");
+        request.workspace = Some(root.path().to_string_lossy().into_owned());
+        let team = svc.create_team("user-test", request).await.unwrap();
+        svc.ensure_session("user-test", &team.id).await.unwrap();
+        let session = Arc::clone(&svc.sessions.get(&team.id).unwrap().session);
+        for agent in &team.assistants {
+            // Keep workers dormant to exercise production's lazy startup path.
+            task_manager.insert_mode_agent(&agent.conversation_id);
+        }
+        task_manager.reset_kills();
+        let board = &session.scheduler().task_board;
+        let task = board.create_task(&team.id, "Project", None, None, &[]).await.unwrap();
+        let state = root.path().join("ops/project-lifecycle");
+        std::fs::create_dir_all(state.join("receipts")).unwrap();
+        std::fs::write(
+            state.join("policy.json"),
+            serde_json::json!({"enabled":true,"engine":"native","team_id":team.id}).to_string(),
+        )
+        .unwrap();
+        let artifact = root.path().join("handoff.md");
+        std::fs::write(&artifact, "accepted").unwrap();
+        let receipt = state.join("receipts/project.json");
+        let value = serde_json::json!({"cleanup_engine":"native-v1","project_id":"p","team_id":team.id,"task_id":task.id,"status":"pending_clear","participant_slots":team.assistants.iter().map(|a|a.slot_id.clone()).collect::<Vec<_>>(),"cleared":{},"files":[{"path":artifact,"sha256":format!("{:x}",Sha256::digest(b"accepted"))}]});
+        std::fs::write(&receipt, value.to_string()).unwrap();
+        svc.process_project_receipts(&session).await.unwrap();
+        assert!(
+            task_manager.kills().is_empty(),
+            "an unfinished task cannot trigger cleanup"
+        );
+        board
+            .update_task(
+                &team.id,
+                &task.id,
+                &TaskUpdate {
+                    status: Some(TaskStatus::Completed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.process_project_receipts(&session).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(result["status"], "cleared");
+        assert_eq!(result["cleared"].as_object().unwrap().len(), 2);
+        let kills = task_manager.kills().len();
+        svc.process_project_receipts(&session).await.unwrap();
+        assert_eq!(task_manager.kills().len(), kills);
+        // Simulate restart during an uncertain operation: never reset a later project silently.
+        let mut interrupted = value;
+        interrupted["resetting"] = team.assistants[0].slot_id.clone().into();
+        std::fs::write(&receipt, interrupted.to_string()).unwrap();
+        svc.process_project_receipts(&session).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        assert_eq!(result["status"], "blocked_interrupted_reset");
+        assert_eq!(task_manager.kills().len(), kills);
     }
 }

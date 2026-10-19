@@ -106,6 +106,7 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    session_directory: PathBuf,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -194,6 +195,7 @@ impl AionrsAgentManager {
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
+        let session_directory = config_extra.session_directory.clone();
         let mut config = resolve_aionui_config(&cli_args)?;
 
         // Backend-specific overrides
@@ -278,6 +280,7 @@ impl AionrsAgentManager {
             runtime,
             engine: Mutex::new(engine),
             slash_commands,
+            session_directory,
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
@@ -285,6 +288,34 @@ impl AionrsAgentManager {
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
+    }
+
+    /// Execute the first-party local /clear command; never send a model prompt.
+    /// Verified against aion-agent engine.rs handle_command/ContextChanged.
+    pub async fn clear_project_context(&self) -> Result<(), AgentError> {
+        if self.runtime.status() == Some(ConversationStatus::Running) {
+            return Err(AgentError::bad_request("CONTEXT_RESET_BUSY"));
+        }
+        let mut engine = self
+            .engine
+            .try_lock()
+            .map_err(|_| AgentError::bad_request("CONTEXT_RESET_BUSY"))?;
+        let result = engine
+            .run("/clear", "project-context-reset")
+            .await
+            .map_err(|error| AgentError::internal(format!("Native context reset failed: {error}")))?;
+        if result.turns != 0 {
+            return Err(AgentError::internal("Native context reset unexpectedly used inference"));
+        }
+        // The SDK logs persistence failures, so verify durable history separately.
+        let store = aion_agent::session::SessionManager::new(self.session_directory.clone(), 100);
+        let saved = store
+            .load(self.runtime.conversation_id())
+            .map_err(|error| AgentError::internal(format!("Context reset readback failed: {error}")))?;
+        if !saved.messages.is_empty() {
+            return Err(AgentError::internal("Context reset durable history is not empty"));
+        }
+        Ok(())
     }
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {

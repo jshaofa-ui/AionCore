@@ -676,10 +676,33 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     }
 
     async fn supports_context_reset(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        if self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .is_some_and(|row| row.r#type == aionui_common::AgentType::Aionrs.serde_name())
+        {
+            return Ok(true);
+        }
+
         self.conversation_service
             .supports_acp_context_reset(user_id, conversation_id)
             .await
             .map_err(map_conversation_update_error)
+    }
+
+    async fn clear_builtin_context(&self, user_id: &str, conversation_id: &str) -> Result<(), TeamError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()))?;
+        match self.task_manager.get_task(conversation_id) {
+            Some(aionui_ai_agent::AgentInstance::Aionrs(agent)) => agent
+                .clear_project_context()
+                .await
+                .map_err(|error| TeamError::InvalidRequest(error.to_string())),
+            _ => Err(TeamError::InvalidRequest("Builtin runtime is not ready".to_owned())),
+        }
     }
 
     async fn clear_context_anchor(&self, user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {

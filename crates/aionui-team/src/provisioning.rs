@@ -151,6 +151,10 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
         Ok(false)
     }
 
+    async fn clear_builtin_context(&self, _user_id: &str, _conversation_id: &str) -> Result<(), TeamError> {
+        Err(TeamError::InvalidRequest("Native builtin reset unavailable".to_owned()))
+    }
+
     async fn clear_context_anchor(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, TeamError> {
         Ok(false)
     }

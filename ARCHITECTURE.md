@@ -759,3 +759,23 @@ anchor while preserving visible history, tasks, and files. Production logs and
 Foundation impact: the internal conversation row patch now supports changing its
 agent type, with the same owner-scoped repository update. No schema migration,
 authentication bypass, new public type-patch endpoint, or raw live SQL is added.
+
+
+## Accepted project context cleanup
+
+The owning team service checks explicit `native-v1` completion receipts under its
+workspace, gated by a disabled-by-default local policy scoped to that team. No
+model polling or persisted employee runtime token is used. Completed task state,
+participant ownership, idle work gates, unchanged deliverable hashes, and durable
+per-slot receipts are checked before resetting workers and then the lead. An
+interrupted or uncertain reset blocks instead of resetting later work on restart.
+
+ACP uses the existing fresh-session anchor reset and runtime attach. Builtin Aion
+executes the first-party SDK local `/clear` command and verifies its persisted
+history is empty (verified: the pinned aion-agent engine `handle_command` and
+`CommandResult::ContextChanged` save path; no inference). Public leader-targeting
+permissions stay unchanged; only the native accepted-project worker may reset an
+idle lead. Optional external Gateway history reset requires a scoped local binding
+and matching confirmed receipt. Visible conversations, files and memberships are
+retained. Info logs record lifecycle results and identifiers, never prompt bodies
+or credentials.

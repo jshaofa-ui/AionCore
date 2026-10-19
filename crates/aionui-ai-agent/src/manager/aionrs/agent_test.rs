@@ -343,3 +343,32 @@ async fn runtime_can_emit_error_and_finish() {
         other => panic!("Expected Finish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn native_project_reset_persists_empty_history_without_provider_calls() {
+    use aion_agent::session::SessionManager;
+    use aion_types::message::{Message, Role};
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.session_directory = dir.path().to_path_buf();
+    config.base_url = Some("http://127.0.0.1:1".to_owned());
+    let store = SessionManager::new(dir.path().to_path_buf(), 100);
+    let mut saved = store
+        .create("anthropic", &config.model, "/project", Some("reset-project"))
+        .unwrap();
+    saved.messages.push(Message::new(
+        Role::User,
+        vec![aion_types::message::ContentBlock::Text {
+            text: "old project secret marker".to_owned(),
+        }],
+    ));
+    store.save(&saved).unwrap();
+    let agent = AionrsAgentManager::new("reset-project".into(), "/project".into(), config, Some(saved))
+        .await
+        .unwrap();
+    agent.clear_project_context().await.unwrap();
+    let after = store.load("reset-project").unwrap();
+    assert!(after.messages.is_empty());
+    agent.clear_project_context().await.unwrap();
+    assert!(store.load("reset-project").unwrap().messages.is_empty());
+}
