@@ -35,6 +35,8 @@ pub trait ChannelTeamDeliveryPort: Send + Sync {
         assistant_id: &str,
         content: &str,
         files: Vec<aionui_api_types::ChatFileRef>,
+        plugin_id: &str,
+        chat_id: &str,
     ) -> Result<Option<String>, String>;
 }
 
@@ -116,8 +118,10 @@ impl ChannelMessageService {
                 .await?
                 .and_then(|s| s.assistant_id)
             {
+                let plugin_id = platform.to_string();
+                let chat_id = session.chat_id.as_deref().unwrap_or("");
                 match port
-                    .deliver_to_team_member(owner_user_id, &assistant_id, text, files.clone())
+                    .deliver_to_team_member(owner_user_id, &assistant_id, text, files.clone(), &plugin_id, chat_id)
                     .await
                 {
                     Ok(Some(team_id)) => {

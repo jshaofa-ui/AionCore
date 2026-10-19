@@ -205,6 +205,7 @@ pub struct ChannelOrchestratorComponents {
 /// assistant is also a team member (e.g. 微信外事 / 飞书外事).
 struct ChannelTeamDeliveryAdapter {
     team: Arc<TeamSessionService>,
+    outbox_dir: std::path::PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -215,13 +216,28 @@ impl aionui_channel::message_service::ChannelTeamDeliveryPort for ChannelTeamDel
         assistant_id: &str,
         content: &str,
         files: Vec<aionui_api_types::ChatFileRef>,
+        plugin_id: &str,
+        chat_id: &str,
     ) -> Result<Option<String>, String> {
         let teams = self.team.list_teams(owner_user_id).await.map_err(|e| e.to_string())?;
         for team in &teams {
             for agent in &team.assistants {
                 if agent.assistant_id.as_deref() == Some(assistant_id) {
+                    let task_id = format!(
+                        "{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|e| e.to_string())?
+                            .as_millis()
+                    );
+                    let reply_path = self.outbox_dir.join(format!("{task_id}.json"));
+                    let reply = format!(
+                        "{}\n\n[渠道回执出口] 处理完成后如需回复该渠道发件人，把回复写到一个新文件：\n{}\n文件内容为 JSON 对象，需包含字段：owner_user_id（值 {}）、plugin_id（值 {}）、chat_id（值 {}）、text（回复正文）。",
+                        content, reply_path.display(), owner_user_id, plugin_id, chat_id
+                    );
                     self.team
-                        .send_message_to_agent(owner_user_id, &team.id, &agent.slot_id, content, Some(files))
+                        .send_message_to_agent(owner_user_id, &team.id, &agent.slot_id, &reply, Some(files))
                         .await
                         .map_err(|e| e.to_string())?;
                     return Ok(Some(team.id.clone()));
@@ -372,10 +388,13 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    let outbox_dir = services.data_dir.join("channel-outbox");
+    std::fs::create_dir_all(&outbox_dir).ok();
     channel_components
         .message_service
         .set_team_delivery(Arc::new(ChannelTeamDeliveryAdapter {
             team: states.team.service.clone(),
+            outbox_dir: outbox_dir.clone(),
         }));
 
     // Late-inject the sidebar's remove-project ports: the team service is built
@@ -852,6 +871,7 @@ pub async fn build_channel_state(
         Arc::clone(&message_service),
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+        services.data_dir.join("channel-outbox"),
     );
 
     let state = ChannelRouterState {

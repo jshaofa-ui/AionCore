@@ -22,6 +22,7 @@ pub struct ChannelOrchestrator {
     message_service: Arc<ChannelMessageService>,
     session_manager: Arc<SessionManager>,
     sender: Arc<dyn ChannelSender>,
+    outbox_dir: std::path::PathBuf,
     queues: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -31,12 +32,14 @@ impl ChannelOrchestrator {
         message_service: Arc<ChannelMessageService>,
         session_manager: Arc<SessionManager>,
         sender: Arc<dyn ChannelSender>,
+        outbox_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             action_executor,
             message_service,
             session_manager,
             sender,
+            outbox_dir,
             queues: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -49,6 +52,9 @@ impl ChannelOrchestrator {
     ) {
         info!("ChannelOrchestrator started");
 
+        let mut outbox_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        outbox_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 Some(msg) = message_rx.recv() => {
@@ -57,11 +63,55 @@ impl ChannelOrchestrator {
                 Some((call_id, value)) = confirm_rx.recv() => {
                     handle_confirm(&call_id, &value);
                 }
+                _ = outbox_interval.tick() => {
+                    self.flush_outbox().await;
+                }
                 else => break,
             }
         }
 
         info!("ChannelOrchestrator stopped (channels closed)");
+    }
+
+    /// Sends queued outbox replies back to their originating channel chat.
+    async fn flush_outbox(&self) {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.outbox_dir).await else { return; };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(&path).await else { continue; };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue; };
+            let owner_user_id = v.get("owner_user_id").and_then(|x| x.as_str()).unwrap_or("");
+            let plugin_id = v.get("plugin_id").and_then(|x| x.as_str()).unwrap_or("");
+            let chat_id = v.get("chat_id").and_then(|x| x.as_str()).unwrap_or("");
+            let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            if owner_user_id.is_empty() || plugin_id.is_empty() || chat_id.is_empty() || text.is_empty() {
+                continue;
+            }
+            let outgoing = UnifiedOutgoingMessage {
+                message_type: OutgoingMessageType::Text,
+                text: Some(text.to_owned()),
+                parse_mode: None,
+                buttons: None,
+                keyboard: None,
+                image_url: None,
+                file_url: None,
+                file_name: None,
+                media_actions: None,
+                reply_to_message_id: None,
+                silent: None,
+            };
+            if self
+                .sender
+                .send_message(owner_user_id, plugin_id, chat_id, outgoing)
+                .await
+                .is_ok()
+            {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
     }
 
     async fn handle_message(&self, msg: UnifiedIncomingMessage) {
