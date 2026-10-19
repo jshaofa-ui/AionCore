@@ -34,6 +34,7 @@ pub struct WeixinPlugin {
     poll_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     context_tokens: Arc<DashMap<String, String>>,
+    pending_media: Arc<DashMap<String, (std::time::Instant, super::types::MediaItemData, bool)>>,
 }
 
 impl Default for WeixinPlugin {
@@ -46,6 +47,7 @@ impl Default for WeixinPlugin {
             poll_handle: None,
             shutdown_tx: None,
             context_tokens: Arc::new(DashMap::new()),
+            pending_media: Arc::new(DashMap::new()),
         }
     }
 }
@@ -121,10 +123,36 @@ impl ChannelPlugin for WeixinPlugin {
             callbacks.message_tx,
             shutdown_rx,
             context_tokens,
+            Arc::clone(&self.pending_media),
         )));
 
         self.status = PluginStatus::Ready;
         Ok(())
+    }
+
+    async fn download_attachments(
+        &self,
+        message: &UnifiedIncomingMessage,
+    ) -> Result<Vec<crate::documents::DownloadedAttachment>, ChannelError> {
+        let mut result = vec![];
+        let mut total = 0;
+        for file in message.content.attachments.as_deref().unwrap_or_default() {
+            let id = file
+                .file_id
+                .as_deref()
+                .ok_or_else(|| ChannelError::PlatformApi("Missing attachment identifier".into()))?;
+            let (_, item, image) = self.pending_media.get(id).map(|v| v.clone()).ok_or_else(|| {
+                ChannelError::PlatformApi("Attachment receipt expired; please resend the file".into())
+            })?;
+            let downloaded = super::media::download(&item, image).await?;
+            total += downloaded.bytes.len();
+            if total > crate::documents::MAX_DOCUMENT_BYTES {
+                return Err(ChannelError::PlatformApi("Attachment batch exceeds size limit".into()));
+            }
+            self.pending_media.remove(id);
+            result.push(downloaded);
+        }
+        Ok(result)
     }
 
     async fn start(&mut self) -> Result<(), ChannelError> {
@@ -206,6 +234,7 @@ async fn poll_loop(
     message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     context_tokens: Arc<DashMap<String, String>>,
+    pending_media: Arc<DashMap<String, (std::time::Instant, super::types::MediaItemData, bool)>>,
 ) {
     let mut buf = String::new();
     let mut consecutive_failures: u32 = 0;
@@ -232,7 +261,7 @@ async fn poll_loop(
                         buf = new_buf;
                     }
                     for msg in resp.msgs.unwrap_or_default() {
-                        handle_message(&msg, &message_tx, &context_tokens).await;
+                        handle_message(&msg, &message_tx, &context_tokens, &pending_media).await;
                     }
                     Ok(())
                 }
@@ -322,6 +351,7 @@ async fn handle_message(
     msg: &WeixinRawMessage,
     message_tx: &tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     context_tokens: &DashMap<String, String>,
+    pending_media: &DashMap<String, (std::time::Instant, super::types::MediaItemData, bool)>,
 ) {
     let from_user_id = match &msg.from_user_id {
         Some(id) if !id.is_empty() => id.clone(),
@@ -336,8 +366,36 @@ async fn handle_message(
     }
 
     let items = msg.item_list.as_deref().unwrap_or_default();
-    let (content_type, text, _has_media) = extract_content(items);
-
+    let (mut content_type, mut text, _has_media) = extract_content(items);
+    pending_media.retain(|_, v| v.0.elapsed() < Duration::from_secs(3600));
+    let mut attachments = vec![];
+    for item in items {
+        let data = match item.item_type {
+            Some(2) => item.image_item.as_ref().map(|v| (v, true)),
+            Some(4) => item.file_item.as_ref().map(|v| (v, false)),
+            _ => None,
+        };
+        if let Some((data, image)) = data {
+            if pending_media.len() >= 128 {
+                break;
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            pending_media.insert(id.clone(), (std::time::Instant::now(), data.clone(), image));
+            attachments.push(crate::types::UnifiedAttachment {
+                file_id: Some(id),
+                file_name: data.file_name.clone(),
+                mime_type: None,
+                file_size: None,
+                url: None,
+            });
+        }
+    }
+    if !attachments.is_empty() {
+        content_type = MessageContentType::Document;
+        if text.is_empty() {
+            text = "请接收并整理这些附件到公司资料库。".to_owned();
+        }
+    }
     if text.is_empty() {
         return;
     }
@@ -350,7 +408,11 @@ async fn handle_message(
 
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
-        id: msg.msg_id.clone().unwrap_or_default(),
+        id: msg
+            .msg_id
+            .clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| format!("receipt-{}", uuid::Uuid::new_v4())),
         platform: PluginType::Weixin,
         chat_id: from_user_id.clone(),
         user: UnifiedUser {
@@ -362,7 +424,11 @@ async fn handle_message(
         content: UnifiedMessageContent {
             content_type,
             text,
-            attachments: None,
+            attachments: if attachments.is_empty() {
+                None
+            } else {
+                Some(attachments)
+            },
         },
         timestamp: chrono_now(),
         reply_to_message_id: None,
@@ -536,6 +602,7 @@ mod tests {
             item_type: Some(2),
             image_item: Some(super::super::types::MediaItemData {
                 media: Some(super::super::types::MediaEncryptInfo {
+                    full_url: None,
                     encrypt_query_param: Some("enc".into()),
                     aes_key: Some("key".into()),
                 }),
@@ -637,5 +704,25 @@ mod tests {
         let (message_tx, _) = tokio::sync::mpsc::channel(16);
         let (confirm_tx, _) = tokio::sync::mpsc::channel(16);
         PluginCallbacks { message_tx, confirm_tx }
+    }
+}
+
+#[cfg(test)]
+mod received_file_tests {
+    use super::*;
+    #[tokio::test]
+    async fn pure_file_is_forwarded_with_opaque_media_reference() {
+        let msg: super::super::types::WeixinRawMessage=serde_json::from_value(serde_json::json!({"msg_id":"fixture-message","from_user_id":"paired-user","item_list":[{"type":4,"file_item":{"file_name":"工程合同.docx","media":{"encrypt_query_param":"private-download-ticket","aes_key":"private-key"}}}]})).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let contexts = DashMap::new();
+        let pending = DashMap::new();
+        handle_message(&msg, &tx, &contexts, &pending).await;
+        let incoming = rx.recv().await.unwrap();
+        assert_eq!(incoming.content.content_type, MessageContentType::Document);
+        assert_eq!(incoming.content.attachments.as_ref().unwrap().len(), 1);
+        assert!(incoming.raw.is_none());
+        let reference = incoming.content.attachments.unwrap()[0].file_id.clone().unwrap();
+        assert!(pending.contains_key(&reference));
+        assert!(!reference.contains("private"));
     }
 }

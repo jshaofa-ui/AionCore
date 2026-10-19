@@ -13,6 +13,9 @@ slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls
 discord = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 
 [dependencies]
+aionui-runtime.workspace = true
+sha2.workspace = true
+aes = "0.8"
 aionui-common.workspace = true
 aionui-auth.workspace = true
 aionui-db.workspace = true
@@ -41,4 +44,5 @@ base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 aionui-ai-agent = { workspace = true, features = ["test-support"] }

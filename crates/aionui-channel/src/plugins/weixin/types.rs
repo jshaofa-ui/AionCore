@@ -87,7 +87,7 @@ pub(crate) struct WeixinRawMessage {
     pub from_user_id: Option<String>,
     #[serde(default)]
     pub context_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "message_id", deserialize_with = "string_or_number_id")]
     pub msg_id: Option<String>,
     #[serde(default)]
     pub item_list: Option<Vec<WeixinRawItem>>,
@@ -134,6 +134,8 @@ pub(crate) struct MediaItemData {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct MediaEncryptInfo {
+    #[serde(default)]
+    pub full_url: Option<String>,
     #[serde(default)]
     pub encrypt_query_param: Option<String>,
     #[serde(default)]
@@ -200,6 +202,27 @@ pub(crate) struct SseErrorEvent {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn string_or_number_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }))
+}
+
+#[cfg(test)]
+mod message_id_compatibility_tests {
+    use super::*;
+    #[test]
+    fn ids_accept_both_wire_names_and_number_values() {
+        let a: WeixinRawMessage = serde_json::from_str(r#"{"message_id":12345}"#).unwrap();
+        assert_eq!(a.msg_id.as_deref(), Some("12345"));
+        let b: WeixinRawMessage = serde_json::from_str(r#"{"msg_id":"wire-id"}"#).unwrap();
+        assert_eq!(b.msg_id.as_deref(), Some("wire-id"));
+    }
+}
 
 #[cfg(test)]
 mod tests {

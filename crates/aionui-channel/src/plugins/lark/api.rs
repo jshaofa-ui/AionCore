@@ -258,6 +258,56 @@ impl LarkApi {
     }
 }
 
+impl LarkApi {
+    pub(crate) async fn download_resource(
+        &self,
+        message_id: &str,
+        file_id: &str,
+        image: bool,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let token = self.get_token().await?;
+        let mut url = reqwest::Url::parse(LARK_OPEN_API_BASE)
+            .map_err(|_| ChannelError::PlatformApi("Invalid Lark API base".into()))?;
+        url.path_segments_mut()
+            .map_err(|_| ChannelError::PlatformApi("Invalid Lark API base".into()))?
+            .extend(["im", "v1", "messages", message_id, "resources", file_id]);
+        url.query_pairs_mut()
+            .append_pair("type", if image { "image" } else { "file" });
+        let mut response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .timeout(std::time::Duration::from_secs(90))
+            .send()
+            .await
+            .map_err(|_| ChannelError::PlatformApi("Lark attachment download failed".into()))?;
+        if !response.status().is_success() {
+            return Err(ChannelError::PlatformApi(format!(
+                "Lark attachment download HTTP {}",
+                response.status()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > crate::documents::MAX_DOCUMENT_BYTES as u64)
+        {
+            return Err(ChannelError::PlatformApi("Attachment exceeds size limit".into()));
+        }
+        let mut bytes = vec![];
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| ChannelError::PlatformApi("Lark attachment transfer interrupted".into()))?
+        {
+            if bytes.len() + chunk.len() > crate::documents::MAX_DOCUMENT_BYTES {
+                return Err(ChannelError::PlatformApi("Attachment exceeds size limit".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

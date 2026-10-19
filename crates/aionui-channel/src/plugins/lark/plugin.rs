@@ -134,6 +134,41 @@ impl ChannelPlugin for LarkPlugin {
         Ok(())
     }
 
+    async fn download_attachments(
+        &self,
+        message: &UnifiedIncomingMessage,
+    ) -> Result<Vec<crate::documents::DownloadedAttachment>, ChannelError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Lark is not initialized".into()))?;
+        let mut result = vec![];
+        let mut total = 0;
+        for file in message.content.attachments.as_deref().unwrap_or_default() {
+            let key = file
+                .file_id
+                .as_deref()
+                .ok_or_else(|| ChannelError::PlatformApi("Missing Lark attachment key".into()))?;
+            let image = file.mime_type.as_deref().is_some_and(|v| v.starts_with("image/"));
+            let bytes = api.download_resource(&message.id, key, image).await?;
+            total += bytes.len();
+            if total > crate::documents::MAX_DOCUMENT_BYTES {
+                return Err(ChannelError::PlatformApi("Attachment batch exceeds size limit".into()));
+            }
+            result.push(crate::documents::DownloadedAttachment {
+                name: file.file_name.clone().unwrap_or_else(|| {
+                    if image {
+                        "飞书图片.jpg".into()
+                    } else {
+                        "飞书附件.bin".into()
+                    }
+                }),
+                bytes,
+            });
+        }
+        Ok(result)
+    }
+
     async fn start(&mut self) -> Result<(), ChannelError> {
         self.status = PluginStatus::Starting;
 

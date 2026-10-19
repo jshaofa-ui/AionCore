@@ -52,6 +52,16 @@ pub trait ChannelPlugin: Send + Sync {
     /// Send a message to a specific chat. Returns the platform message ID.
     async fn send_message(&self, chat_id: &str, message: UnifiedOutgoingMessage) -> Result<String, ChannelError>;
 
+    /// Called only after sender pairing has authorized this incoming message.
+    async fn download_attachments(
+        &self,
+        _message: &UnifiedIncomingMessage,
+    ) -> Result<Vec<crate::documents::DownloadedAttachment>, ChannelError> {
+        Err(ChannelError::MessageSendFailed(
+            "This channel cannot download these attachments".to_owned(),
+        ))
+    }
+
     /// Edit an existing message on the platform.
     ///
     /// Platforms that don't support editing (e.g., WeChat) may implement

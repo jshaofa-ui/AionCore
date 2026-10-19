@@ -23,10 +23,27 @@ const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer suppor
 /// - Receiving stream events and converting them to outgoing messages
 /// - Throttling editMessage calls for streaming responses
 /// - Handling tool confirmation with timeout
+/// Port that lets the channel layer route a message to a team member slot
+/// when the channel's bound assistant is also a team member.
+#[async_trait::async_trait]
+pub trait ChannelTeamDeliveryPort: Send + Sync {
+    /// If `assistant_id` belongs to a team member, deliver `content`+`files`
+    /// to that member's slot and return `Ok(Some(team_id))`. Otherwise `Ok(None)`.
+    async fn deliver_to_team_member(
+        &self,
+        owner_user_id: &str,
+        assistant_id: &str,
+        content: &str,
+        files: Vec<aionui_api_types::ChatFileRef>,
+    ) -> Result<Option<String>, String>;
+}
+
 pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
+    archive_policy: Option<std::path::PathBuf>,
+    team_delivery: std::sync::RwLock<Option<Arc<dyn ChannelTeamDeliveryPort>>>,
 }
 
 impl ChannelMessageService {
@@ -39,7 +56,28 @@ impl ChannelMessageService {
             conversation_svc,
             task_manager,
             settings,
+            archive_policy: None,
+            team_delivery: std::sync::RwLock::new(None),
         }
+    }
+    pub fn with_document_archive(mut self, path: std::path::PathBuf) -> Self {
+        self.archive_policy = Some(path);
+        self
+    }
+    pub fn set_team_delivery(&self, port: Arc<dyn ChannelTeamDeliveryPort>) {
+        *self.team_delivery.write().expect("team delivery lock poisoned") = Some(port);
+    }
+    pub async fn prepare_documents(
+        &self,
+        owner: &str,
+        message: &crate::types::UnifiedIncomingMessage,
+        files: Vec<crate::documents::DownloadedAttachment>,
+    ) -> Result<crate::documents::PreparedDocuments, ChannelError> {
+        let path = self
+            .archive_policy
+            .as_ref()
+            .ok_or_else(|| ChannelError::MessageSendFailed("Company archive is not configured".to_owned()))?;
+        crate::documents::archive(path, owner, message, files).await
     }
 
     /// Sends a text message from a channel user to the AI agent.
@@ -58,6 +96,40 @@ impl ChannelMessageService {
         text: &str,
         platform: PluginType,
     ) -> Result<SendResult, ChannelError> {
+        self.send_to_agent_with_files(owner_user_id, session, text, platform, vec![])
+            .await
+    }
+    pub async fn send_to_agent_with_files(
+        &self,
+        owner_user_id: &str,
+        session: &AssistantSessionRow,
+        text: &str,
+        platform: PluginType,
+        files: Vec<aionui_api_types::ChatFileRef>,
+    ) -> Result<SendResult, ChannelError> {
+        // Route to a team member slot when the channel assistant is a teammate.
+        let team_port = self.team_delivery.read().expect("team delivery lock poisoned").clone();
+        if let Some(port) = team_port {
+            if let Some(assistant_id) = self
+                .settings
+                .get_assistant_setting(owner_user_id, platform)
+                .await?
+                .and_then(|s| s.assistant_id)
+            {
+                match port
+                    .deliver_to_team_member(owner_user_id, &assistant_id, text, files.clone())
+                    .await
+                {
+                    Ok(Some(team_id)) => {
+                        info!(team_id = %team_id, assistant_id = %assistant_id, "channel message routed to team member");
+                        return Ok(SendResult { conversation_id: team_id, stream_rx: None });
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!(error = %error, "team delivery failed; falling back to standalone channel conversation"),
+                }
+            }
+        }
+
         // Ensure conversation exists
         let conversation_id = match &session.conversation_id {
             Some(cid) => cid.clone(),
@@ -73,7 +145,7 @@ impl ChannelMessageService {
         // `conversation_id` + stream events instead of a client-provided id.
         let req = SendMessageRequest {
             content: text.to_owned(),
-            files: vec![],
+            files,
             // Channel traffic has no `@@` picker, so never any session refs.
             sessions: vec![],
             inject_skills: vec![],
@@ -89,6 +161,20 @@ impl ChannelMessageService {
             .warmup(user_id, &conversation_id, &self.task_manager)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while self
+                .task_manager
+                .get_task(&conversation_id)
+                .is_some_and(|task| task.status() == Some(aionui_common::ConversationStatus::Running))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            ChannelError::MessageSendFailed("Assistant is still busy; this request has not started".to_owned())
+        })?;
 
         let stream_rx = self
             .task_manager

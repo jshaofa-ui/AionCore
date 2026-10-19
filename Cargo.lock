@@ -528,6 +528,7 @@ dependencies = [
 name = "aionui-channel"
 version = "0.2.2"
 dependencies = [
+ "aes",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",
@@ -536,6 +537,7 @@ dependencies = [
  "aionui-db",
  "aionui-extension",
  "aionui-realtime",
+ "aionui-runtime",
  "async-trait",
  "axum",
  "base64",
@@ -549,6 +551,8 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.26.2",

@@ -197,6 +197,39 @@ pub struct ChannelOrchestratorComponents {
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
+    pub message_service: Arc<aionui_channel::message_service::ChannelMessageService>,
+}
+
+
+/// Routes a channel message to a team member slot when the channel's bound
+/// assistant is also a team member (e.g. 微信外事 / 飞书外事).
+struct ChannelTeamDeliveryAdapter {
+    team: Arc<TeamSessionService>,
+}
+
+#[async_trait::async_trait]
+impl aionui_channel::message_service::ChannelTeamDeliveryPort for ChannelTeamDeliveryAdapter {
+    async fn deliver_to_team_member(
+        &self,
+        owner_user_id: &str,
+        assistant_id: &str,
+        content: &str,
+        files: Vec<aionui_api_types::ChatFileRef>,
+    ) -> Result<Option<String>, String> {
+        let teams = self.team.list_teams(owner_user_id).await.map_err(|e| e.to_string())?;
+        for team in &teams {
+            for agent in &team.assistants {
+                if agent.assistant_id.as_deref() == Some(assistant_id) {
+                    self.team
+                        .send_message_to_agent(owner_user_id, &team.id, &agent.slot_id, content, Some(files))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    return Ok(Some(team.id.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -339,6 +372,12 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    channel_components
+        .message_service
+        .set_team_delivery(Arc::new(ChannelTeamDeliveryAdapter {
+            team: states.team.service.clone(),
+        }));
+
     // Late-inject the sidebar's remove-project ports: the team service is built
     // after the sidebar state above, so the wiring cannot happen inside
     // `build_sidebar_state`. `set_remove_project_ports` is set-once.
@@ -735,11 +774,14 @@ async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        Arc::new(services.conversation_service.clone()),
-        services.worker_task_manager.clone(),
-        channel_settings,
-    ))
+    Arc::new(
+        aionui_channel::message_service::ChannelMessageService::new(
+            Arc::new(services.conversation_service.clone()),
+            services.worker_task_manager.clone(),
+            channel_settings,
+        )
+        .with_document_archive(services.data_dir.join("company-document-archive.json")),
+    )
 }
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
@@ -807,7 +849,7 @@ pub async fn build_channel_state(
 
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
-        message_service,
+        Arc::clone(&message_service),
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
     );
@@ -829,6 +871,7 @@ pub async fn build_channel_state(
         manager,
         plugin_factory,
         owner_user_id: startup_owner_user_id,
+        message_service,
     };
 
     (state, components)

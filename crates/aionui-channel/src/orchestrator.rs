@@ -22,6 +22,7 @@ pub struct ChannelOrchestrator {
     message_service: Arc<ChannelMessageService>,
     session_manager: Arc<SessionManager>,
     sender: Arc<dyn ChannelSender>,
+    queues: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ChannelOrchestrator {
@@ -36,6 +37,7 @@ impl ChannelOrchestrator {
             message_service,
             session_manager,
             sender,
+            queues: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -77,6 +79,9 @@ impl ChannelOrchestrator {
         let session_mgr = Arc::clone(&self.session_manager);
         let sender = Arc::clone(&self.sender);
 
+        let queue_key = serde_json::to_string(&(message_owner_user_id.as_deref(), platform.to_string(), &chat_id))
+            .expect("channel key");
+        let queues = Arc::clone(&self.queues);
         tokio::spawn(async move {
             match executor.handle_incoming_message(&msg).await {
                 Ok(MessageResult::Action(response)) => {
@@ -91,6 +96,39 @@ impl ChannelOrchestrator {
                     session_id,
                     conversation_id,
                 }) => {
+                    // Serialize a chat through the final relay, not only request submission.
+                    let queue = Arc::clone(
+                        queues
+                            .entry(queue_key)
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .value(),
+                    );
+                    let _turn = queue.lock().await;
+                    let mut text = text;
+                    let files = if msg.content.attachments.as_ref().is_some_and(|a| !a.is_empty()) {
+                        let prepared = match sender.download_attachments(&owner_user_id, &plugin_id, &msg).await {
+                            Ok(downloaded) => msg_svc.prepare_documents(&owner_user_id, &msg, downloaded).await,
+                            Err(error) => Err(error),
+                        };
+                        match prepared {
+                            Ok(prepared) => {
+                                text = format!("{}\n\n{}", text, prepared.instruction);
+                                prepared.files
+                            }
+                            Err(error) => {
+                                warn!("channel attachment preparation failed");
+                                let outgoing = ChannelMessageService::build_streaming_message(&format!(
+                                    "附件尚未完成接收或归档：{error}。不会将其标成已读取。"
+                                ));
+                                let _ = sender
+                                    .send_message(&owner_user_id, &plugin_id, &chat_id, outgoing)
+                                    .await;
+                                return;
+                            }
+                        }
+                    } else {
+                        vec![]
+                    };
                     handle_dispatched(
                         &msg_svc,
                         &session_mgr,
@@ -99,6 +137,7 @@ impl ChannelOrchestrator {
                         &session_id,
                         conversation_id.as_deref(),
                         &text,
+                        files,
                         platform,
                         &plugin_id,
                         &chat_id,
@@ -162,6 +201,7 @@ async fn handle_dispatched(
     session_id: &str,
     conversation_id: Option<&str>,
     text: &str,
+    files: Vec<aionui_api_types::ChatFileRef>,
     platform: crate::types::PluginType,
     plugin_id: &str,
     chat_id: &str,
@@ -178,7 +218,10 @@ async fn handle_dispatched(
         }
     };
 
-    let send_result = match msg_svc.send_to_agent(owner_user_id, &session, text, platform).await {
+    let send_result = match msg_svc
+        .send_to_agent_with_files(owner_user_id, &session, text, platform, files)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to send to agent");
@@ -219,7 +262,7 @@ async fn handle_dispatched(
             throttle_ms: throttle_ms_for_platform(platform),
         };
         let relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender));
-        tokio::spawn(relay.run(rx));
+        relay.run(rx).await;
     } else {
         warn!(
             conversation_id = %send_result.conversation_id,

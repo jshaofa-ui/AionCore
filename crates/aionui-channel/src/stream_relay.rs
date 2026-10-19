@@ -39,6 +39,17 @@ pub fn throttle_ms_for_platform(platform: PluginType) -> u64 {
 /// Decouples ChannelStreamRelay from ChannelManager for testability.
 #[async_trait]
 pub trait ChannelSender: Send + Sync {
+    async fn download_attachments(
+        &self,
+        _owner: &str,
+        _plugin: &str,
+        _message: &crate::types::UnifiedIncomingMessage,
+    ) -> Result<Vec<crate::documents::DownloadedAttachment>, ChannelError> {
+        Err(ChannelError::MessageSendFailed(
+            "Attachment download unavailable".to_owned(),
+        ))
+    }
+
     async fn send_message(
         &self,
         owner_user_id: &str,

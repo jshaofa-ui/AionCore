@@ -4,6 +4,7 @@
 pub mod action;
 pub mod channel_settings;
 pub mod constants;
+pub mod documents;
 pub mod error;
 pub mod formatter;
 pub mod manager;

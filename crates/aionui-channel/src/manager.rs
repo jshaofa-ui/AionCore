@@ -641,6 +641,19 @@ impl ChannelManager {
 
 #[async_trait::async_trait]
 impl crate::stream_relay::ChannelSender for ChannelManager {
+    async fn download_attachments(
+        &self,
+        owner: &str,
+        plugin_id: &str,
+        message: &crate::types::UnifiedIncomingMessage,
+    ) -> Result<Vec<crate::documents::DownloadedAttachment>, ChannelError> {
+        let plugin = self
+            .plugins
+            .get(&Self::runtime_key(owner, plugin_id))
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin.download_attachments(message).await
+    }
+
     async fn send_message(
         &self,
         owner_user_id: &str,
