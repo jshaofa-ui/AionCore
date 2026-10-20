@@ -166,7 +166,7 @@ impl ChannelOrchestrator {
                                 prepared.files
                             }
                             Err(error) => {
-                                warn!("channel attachment preparation failed");
+                                warn!(error = %error, "channel attachment preparation failed");
                                 let outgoing = ChannelMessageService::build_streaming_message(&format!(
                                     "附件尚未完成接收或归档：{error}。不会将其标成已读取。"
                                 ));
