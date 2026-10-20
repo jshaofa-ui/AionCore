@@ -233,7 +233,7 @@ impl aionui_channel::message_service::ChannelTeamDeliveryPort for ChannelTeamDel
                     );
                     let reply_path = self.outbox_dir.join(format!("{task_id}.json"));
                     let reply = format!(
-                        "{}\n\n[渠道回执出口] 处理完成后如需回复该渠道发件人，把回复写到一个新文件：\n{}\n文件内容为 JSON 对象，需包含字段：owner_user_id（值 {}）、plugin_id（值 {}）、chat_id（值 {}）、text（回复正文）。",
+                        "{}\n\n[渠道回执出口] 处理完成后必须回复该渠道发件人：把回复（先写结论，再写正文）写到一个新文件：\n{}\n文件内容为 JSON 对象，需包含字段：owner_user_id（值 {}）、plugin_id（值 {}）、chat_id（值 {}）、text（回复正文）。",
                         content, reply_path.display(), owner_user_id, plugin_id, chat_id
                     );
                     self.team

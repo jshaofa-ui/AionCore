@@ -314,10 +314,22 @@ async fn handle_dispatched(
         let relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender));
         relay.run(rx).await;
     } else {
-        warn!(
-            conversation_id = %send_result.conversation_id,
-            "no agent task for stream subscription"
-        );
+        // Team-routed delivery has no stream back: acknowledge immediately so
+        // the channel sender gets instant feedback while the 外事 processes.
+        let ack = UnifiedOutgoingMessage {
+            message_type: OutgoingMessageType::Text,
+            text: Some("已收到，正在处理中，完成后会回复你。".to_owned()),
+            parse_mode: None,
+            buttons: None,
+            keyboard: None,
+            image_url: None,
+            file_url: None,
+            file_name: None,
+            media_actions: None,
+            reply_to_message_id: None,
+            silent: None,
+        };
+        let _ = sender.send_message(owner_user_id, plugin_id, chat_id, ack).await;
     }
 }
 
