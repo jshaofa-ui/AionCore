@@ -51,6 +51,16 @@ impl IUserRepository for SqliteUserRepository {
         Ok(user)
     }
 
+    async fn get_aionpro_user(&self) -> Result<Option<User>, DbError> {
+        let user = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE user_type = 'aionpro' AND status = 'active' ORDER BY created_at ASC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(user)
+    }
+
     async fn set_system_user_credentials(&self, username: &str, password_hash: &str) -> Result<(), DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(

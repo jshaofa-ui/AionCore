@@ -22,6 +22,9 @@ pub trait IUserRepository: Send + Sync {
     /// Priority: system default user first, then falls back to a user named "admin".
     async fn get_primary_webui_user(&self) -> Result<Option<User>, DbError>;
 
+    /// Returns the first active AionPro user, if any.
+    async fn get_aionpro_user(&self) -> Result<Option<User>, DbError>;
+
     /// Updates the system default user's username and password hash.
     ///
     /// Used during the initial bootstrap flow.

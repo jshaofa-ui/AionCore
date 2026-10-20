@@ -805,7 +805,13 @@ async fn build_channel_message_service(
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
     if services.identity_mode == IdentityMode::AionPro {
-        return None;
+        return services
+            .user_repo
+            .get_aionpro_user()
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.id);
     }
 
     let owner_user_id = services
