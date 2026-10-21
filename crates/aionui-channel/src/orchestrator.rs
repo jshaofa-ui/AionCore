@@ -75,14 +75,20 @@ impl ChannelOrchestrator {
 
     /// Sends queued outbox replies back to their originating channel chat.
     async fn flush_outbox(&self) {
-        let Ok(mut entries) = tokio::fs::read_dir(&self.outbox_dir).await else { return; };
+        let Ok(mut entries) = tokio::fs::read_dir(&self.outbox_dir).await else {
+            return;
+        };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(bytes) = tokio::fs::read(&path).await else { continue; };
-            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue; };
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
             let owner_user_id = v.get("owner_user_id").and_then(|x| x.as_str()).unwrap_or("");
             let plugin_id = v.get("plugin_id").and_then(|x| x.as_str()).unwrap_or("");
             let chat_id = v.get("chat_id").and_then(|x| x.as_str()).unwrap_or("");
@@ -162,6 +168,14 @@ impl ChannelOrchestrator {
                         };
                         match prepared {
                             Ok(prepared) => {
+                                let receipt = ChannelMessageService::build_streaming_message(
+                                    "附件原件及整理笔记已归档到 Obsidian 公司资料库。正文提取状态见笔记；未提取的文件仍需解析或 OCR，尚不能视为已读完。接下来将转交外事处理。",
+                                );
+                                if let Err(error) =
+                                    sender.send_message(&owner_user_id, &plugin_id, &chat_id, receipt).await
+                                {
+                                    warn!(error = %error, "channel archive receipt delivery failed");
+                                }
                                 text = format!("{}\n\n{}", text, prepared.instruction);
                                 prepared.files
                             }

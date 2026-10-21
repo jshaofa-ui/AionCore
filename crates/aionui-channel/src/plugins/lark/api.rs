@@ -281,10 +281,31 @@ impl LarkApi {
             .send()
             .await
             .map_err(|_| ChannelError::PlatformApi("Lark attachment download failed".into()))?;
-        if !response.status().is_success() {
+        let status = response.status();
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("application/json"));
+        if !status.is_success() {
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| ChannelError::PlatformApi("Lark error response interrupted".into()))?
+            {
+                if body.len() + chunk.len() > 65536 {
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let code = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("code").and_then(|c| c.as_i64()));
+            // Provider messages can echo credentials or attachment identifiers.
             return Err(ChannelError::PlatformApi(format!(
-                "Lark attachment download HTTP {}",
-                response.status()
+                "Lark attachment download HTTP {status}; business_code={code:?}; resource_type={}",
+                if image { "image" } else { "file" }
             )));
         }
         if response
@@ -304,13 +325,38 @@ impl LarkApi {
             }
             bytes.extend_from_slice(&chunk);
         }
+        if bytes.is_empty() {
+            return Err(ChannelError::PlatformApi("Lark attachment is empty".into()));
+        }
+        if is_json && let Some(code) = attachment_business_error(&bytes) {
+            return Err(ChannelError::PlatformApi(format!(
+                "Lark attachment business_code={code}"
+            )));
+        }
         Ok(bytes)
     }
+}
+
+fn attachment_business_error(bytes: &[u8]) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let code = value.get("code")?.as_i64()?;
+    (code != 0 && value.get("msg").is_some_and(|v| v.is_string())).then_some(code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_business_errors_do_not_accept_error_json_as_files() {
+        assert_eq!(
+            attachment_business_error(br#"{"code":234001,"msg":"resource unavailable"}"#),
+            Some(234001)
+        );
+        assert_eq!(attachment_business_error(br#"{"code":0,"msg":"ok"}"#), None);
+        assert_eq!(attachment_business_error(br#"{"project":"contract"}"#), None);
+        assert_eq!(attachment_business_error(b"%PDF-1.7"), None);
+    }
 
     #[test]
     fn api_stores_credentials() {

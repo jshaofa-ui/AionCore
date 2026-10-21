@@ -111,25 +111,29 @@ impl ChannelMessageService {
     ) -> Result<SendResult, ChannelError> {
         // Route to a team member slot when the channel assistant is a teammate.
         let team_port = self.team_delivery.read().expect("team delivery lock poisoned").clone();
-        if let Some(port) = team_port {
-            if let Some(assistant_id) = self
+        if let Some(port) = team_port
+            && let Some(assistant_id) = self
                 .settings
                 .get_assistant_setting(owner_user_id, platform)
                 .await?
                 .and_then(|s| s.assistant_id)
+        {
+            let plugin_id = platform.to_string();
+            let chat_id = session.chat_id.as_deref().unwrap_or("");
+            match port
+                .deliver_to_team_member(owner_user_id, &assistant_id, text, files.clone(), &plugin_id, chat_id)
+                .await
             {
-                let plugin_id = platform.to_string();
-                let chat_id = session.chat_id.as_deref().unwrap_or("");
-                match port
-                    .deliver_to_team_member(owner_user_id, &assistant_id, text, files.clone(), &plugin_id, chat_id)
-                    .await
-                {
-                    Ok(Some(team_id)) => {
-                        info!(team_id = %team_id, assistant_id = %assistant_id, "channel message routed to team member");
-                        return Ok(SendResult { conversation_id: team_id, stream_rx: None });
-                    }
-                    Ok(None) => {}
-                    Err(error) => warn!(error = %error, "team delivery failed; falling back to standalone channel conversation"),
+                Ok(Some(team_id)) => {
+                    info!(team_id = %team_id, assistant_id = %assistant_id, "channel message routed to team member");
+                    return Ok(SendResult {
+                        conversation_id: team_id,
+                        stream_rx: None,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(error = %error, "team delivery failed; falling back to standalone channel conversation")
                 }
             }
         }
