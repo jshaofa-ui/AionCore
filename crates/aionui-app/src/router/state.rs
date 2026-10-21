@@ -200,7 +200,6 @@ pub struct ChannelOrchestratorComponents {
     pub message_service: Arc<aionui_channel::message_service::ChannelMessageService>,
 }
 
-
 /// Routes a channel message to a team member slot when the channel's bound
 /// assistant is also a team member (e.g. 微信外事 / 飞书外事).
 struct ChannelTeamDeliveryAdapter {
@@ -234,7 +233,11 @@ impl aionui_channel::message_service::ChannelTeamDeliveryPort for ChannelTeamDel
                     let reply_path = self.outbox_dir.join(format!("{task_id}.json"));
                     let reply = format!(
                         "{}\n\n[渠道回执出口] 处理完成后必须回复该渠道发件人：把回复（先写结论，再写正文）写到一个新文件：\n{}\n文件内容为 JSON 对象，需包含字段：owner_user_id（值 {}）、plugin_id（值 {}）、chat_id（值 {}）、text（回复正文）。",
-                        content, reply_path.display(), owner_user_id, plugin_id, chat_id
+                        content,
+                        reply_path.display(),
+                        owner_user_id,
+                        plugin_id,
+                        chat_id
                     );
                     self.team
                         .send_message_to_agent(owner_user_id, &team.id, &agent.slot_id, &reply, Some(files))
@@ -805,13 +808,7 @@ async fn build_channel_message_service(
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
     if services.identity_mode == IdentityMode::AionPro {
-        return services
-            .user_repo
-            .get_aionpro_user()
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.id);
+        return services.user_repo.get_aionpro_user().await.ok().flatten().map(|u| u.id);
     }
 
     let owner_user_id = services
