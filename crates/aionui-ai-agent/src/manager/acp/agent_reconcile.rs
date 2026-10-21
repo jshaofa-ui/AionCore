@@ -1,4 +1,4 @@
-use crate::manager::acp::AcpAgentManager;
+use crate::manager::acp::{AcpAgentManager, AcpSession};
 
 use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode_for_available_values;
@@ -10,6 +10,16 @@ use std::collections::VecDeque;
 use tracing::{error, info, warn};
 
 const MAX_RECONCILE_ACTIONS: usize = 8;
+
+fn confirm_reconciled_model(session: &mut AcpSession, session_id: &str, model: ModelId) -> Result<(), AcpError> {
+    if session.session_id() != Some(session_id) {
+        return Err(AcpError::SessionNotFound {
+            session_id: session_id.to_owned(),
+        });
+    }
+    session.confirm_model(model);
+    Ok(())
+}
 
 /// Actions the session driver must execute to align CLI state with user intent.
 ///
@@ -130,6 +140,11 @@ impl AcpAgentManager {
                         );
                         continue;
                     }
+                    // Legacy model ACKs carry no catalog update. Confirm the
+                    // accepted value before publishing or reading a snapshot.
+                    let mut session = self.session.write().await;
+                    confirm_reconciled_model(&mut session, session_id, model)?;
+                    self.commit_session_changes(&mut session).await;
                 }
 
                 ReconcileAction::SetConfigOption { key, value } => {
@@ -312,5 +327,32 @@ mod tests {
 
         let events = session.drain_events();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn acknowledged_startup_model_updates_readback_and_stops_reconcile_drift() {
+        use crate::manager::acp::legacy_session_model::{LegacyModelEntry, LegacySessionModelState};
+        let mut session = AcpSession::new(None, Some(ModelId::new("local")), HashMap::new());
+        session.set_session_id(crate::shared_kernel::SessionId::new("active"));
+        session.apply_advertised_models(LegacySessionModelState::new(
+            "old",
+            vec![
+                LegacyModelEntry::new("old", "Old"),
+                LegacyModelEntry::new("local", "Local"),
+            ],
+        ));
+        confirm_reconciled_model(&mut session, "active", ModelId::new("local")).unwrap();
+        assert_eq!(session.current_model_id().as_deref(), Some("local"));
+        assert!(session.plan_reconcile().is_empty());
+    }
+
+    #[test]
+    fn stale_startup_model_ack_cannot_change_a_new_session() {
+        let mut session = AcpSession::new(None, None, HashMap::new());
+        session.set_session_id(crate::shared_kernel::SessionId::new("new"));
+        session.apply_observed_model(ModelId::new("keep"));
+        let result = confirm_reconciled_model(&mut session, "old", ModelId::new("wrong"));
+        assert!(matches!(result, Err(AcpError::SessionNotFound { .. })));
+        assert_eq!(session.current_model_id().as_deref(), Some("keep"));
     }
 }
